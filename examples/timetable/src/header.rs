@@ -43,7 +43,7 @@ fn dot(p: &Pal) -> El { el().size(3.0, 3.0).radius(1.5).fill(p.sep) }
 
 /// The "U" seal: a brass gradient that the compositor turns into flowing liquid metal.
 /// Hovering it wakes the metal for a few seconds.
-fn seal(s: &State, p: &Pal) -> El {
+pub fn seal(s: &State, p: &Pal) -> El {
     el().key("seal").size(34.0, 34.0).radius(10.0).center()
         .linear_gradient(2.4, [(0.0, p.brass.mix(p.raised, 0.35)), (0.55, p.brass), (1.0, p.brass.mix(p.bg, 0.45))])
         .shadow(2.0, 8.0, p.shadow).press_scale(0.92)
@@ -54,12 +54,12 @@ fn seal(s: &State, p: &Pal) -> El {
 }
 
 /// Lights on or off: a bulb that glows when the scene is lit.
-fn lamp_button(s: &State, p: &Pal) -> El {
-    let on = s.lights;
+pub fn lamp_button(s: &State, p: &Pal) -> El {
+    let on = s.shown_lights.get();
     el().key("lamp").size(34.0, 34.0).radius(17.0).center().fill(p.raised).border(1.0, if on { p.brass } else { p.sep })
         .hover(p.hover).press_scale(0.9).motion(Spring::BOUNCY)
         .shadow(0.0, if on { 16.0 } else { 0.0 }, p.brass.alpha(if on { 0.55 } else { 0.0 }))
-        .on_press(|s: &mut State| s.lights = !s.lights)
+        .on_press(|s: &mut State| crate::toggle_lights(s))
         .label(if on { "Turn lights off" } else { "Turn lights on" })
         .child(col().items_center().gap(1.0)
             .child(el().key("bulb").size(12.0, 12.0).radius(6.0).fill(if on { p.brass } else { p.sub.alpha(0.4) }).scale(if on { 1.0 } else { 0.8 }).motion(Spring::BOUNCY))
@@ -76,7 +76,7 @@ fn search_button(p: &Pal) -> El {
 
 /// A sun whose rays retract while the disc turns half a revolution and a shadow slides across
 /// it into a crescent.
-fn theme_switch(s: &State, p: &Pal) -> El {
+pub fn theme_switch(s: &State, p: &Pal) -> El {
     let dark = p.dark;
     let spin = Spring::new(0.7, 0.28);
     let mut sun = el().key("sun").size(30.0, 30.0).rotate(if dark { PI } else { 0.0 }).rotate_motion(spin);

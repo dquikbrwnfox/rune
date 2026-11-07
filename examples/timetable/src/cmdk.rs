@@ -33,6 +33,7 @@ fn dept(c: &Course) -> &'static str {
 }
 
 fn choose(s: &mut State, i: usize) {
+    s.tab = 0;
     add(s, i);
     close(s);
 }
@@ -89,7 +90,10 @@ pub fn palette(s: &State, p: &Pal) -> El {
         list = list.child(el().key("cmdk-none").w_full().h(60.0).center().child(text("No courses match.").font(BODY).color(p.sub)));
     }
 
-    let panel = col().key("cmdk-panel").mark(crate::mark::CARD).w(560.0).radius(16.0).fill(p.card.alpha(0.92)).border(1.0, p.sep)
+    let small = crate::grid::compact();
+    let panel = col().key("cmdk-panel").mark(crate::mark::CARD);
+    let panel = if small { panel.w_full() } else { panel.w(560.0) };
+    let panel = panel.radius(16.0).fill(p.card.alpha(0.92)).border(1.0, p.sep)
         .shadow(24.0, 60.0, p.shadow).clip_rounded(16.0)
         .transition(Transition::scale(0.94).combined(Transition::opacity()).combined(Transition::offset(0.0, -12.0)))
         .child(input)
@@ -103,5 +107,5 @@ pub fn palette(s: &State, p: &Pal) -> El {
     layer().key("cmdk").fill(p.scrim).backdrop_blur(14.0)
         .transition(Transition::opacity())
         .modal(true, close)
-        .child(col().w_full().pt(110.0).items_center().child(panel))
+        .child(col().w_full().pt(if small { 64.0 } else { 110.0 }).px(if small { 10.0 } else { 0.0 }).items_center().child(panel))
 }

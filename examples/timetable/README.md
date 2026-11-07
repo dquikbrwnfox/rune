@@ -41,11 +41,23 @@ WebGPU needs HTTPS, which `*.workers.dev` provides.
 
 Today's column gets a brass wash and a TODAY tag. During class hours a red "now" line breathes across it.
 
+## On a phone
+
+Under 720 pt wide the app switches to a phone layout (`mobile.rs`). The desktop layout is unchanged.
+
+- **Masthead:** the seal, the title, a stats line with a CLASH chip, and search, lamp and theme buttons.
+- **Week tab:** day pills (red dot for a day with a clash, brass for today) over one day at a time. Swipe sideways to page between days; the day follows your finger, then the next one slides in from that side. The hour height shrinks to fit the screen, so the day never scrolls.
+- **Courses tab:** the course cards and stream chips at full width, with 36 pt chips for touch.
+- **Palette:** opens as a full-width sheet. Adding a course jumps to the Week tab so you see it land.
+- **Lighting:** starts off to save fill-rate and battery on high-DPR screens. The bulb turns it on.
+- **Effects:** everything else still plays, with smaller flames so the text stays readable.
+- **Safe areas:** the layout stays inside them (notch, home bar).
+
 ## Layout
 
 - `model.rs`: sessions, ghosts, clashes, lanes. `data.rs`: sample catalogue.
 - `lib.rs`: state, actions, `poll` (clash triggers, timed effects, clock), keys.
-- `header.rs`, `side.rs`, `grid.rs`, `cmdk.rs`: views. `pal.rs`: both themes.
+- `header.rs`, `side.rs`, `grid.rs`, `cmdk.rs`: views; `mobile.rs`: the phone layout. `pal.rs`: both themes.
 - `gfx.rs`: the compositor. Lights on, the UI is drawn linear into an HDR texture and lit by rune-light (slabs, sun, lamp, firelight), then rune-fx layers (fire, lightning, aurora, zap, sparkles, neon glow, radar, ripple, liquid-metal seal, sheen) are drawn over it. Lights off, effects slot into the normal paint order (plus paper grain),
   behind the default `fx` feature. Each one-shot effect carries a sequence number; the compositor
   asks for frames only while one plays, so an idle window draws nothing.

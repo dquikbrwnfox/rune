@@ -35,12 +35,15 @@ pub fn sidebar(s: &State, p: &Pal) -> El {
                 .font(BODY).color(p.sub).w_full().wrap())
             .child(el().key("sample").h(32.0).px(12.0).center().radius(8.0).fill(p.brass).press_scale(0.96)
                 .child(text("Try a sample first year").font(LABEL).color(p.bg))
-                .on_press(|st: &mut State| for c in [0, 2, 4] { add(st, c) })));
+                .on_press(|st: &mut State| { for c in [0, 2, 4] { add(st, c) } st.tab = 0; })));
     }
     let clashes = clash_set(&s.cat, &s.enr);
     for e in &s.enr { list = list.child(course_card(s, e, p, &clashes)); }
 
-    col().key("side").w(320.0).h_full().padding(16.0).gap(12.0).fill(p.bg).border(1.0, p.sep)
+    let small = crate::grid::compact();
+    let side = col().key("side");
+    let side = if small { side.w_full().grow(1.0).min_h(0.0) } else { side.w(320.0).h_full().border(1.0, p.sep) };
+    side.padding(if small { 12.0 } else { 16.0 }).gap(12.0).fill(p.bg)
         .child(search)
         .child(list.scroll(ScrollSpec { stick_bottom: false }).scroll_edge_fade(12.0).grow(1.0).min_h(0.0))
 }
@@ -69,7 +72,7 @@ fn course_card(s: &State, e: &Enr, p: &Pal, clashes: &std::collections::HashSet<
             let bad = clashes.contains(&(course, kind, i));
             let edge = if bad { p.danger } else { tc };
             let hot = s.hover == Some((course, kind, i));
-            let chip = el().key(format!("chip-{course}-{kind}-{i}")).h(26.0).px(10.0).center().radius(7.0)
+            let chip = el().key(format!("chip-{course}-{kind}-{i}")).h(if crate::grid::compact() { 36.0 } else { 26.0 }).px(10.0).center().radius(7.0)
                 .press_scale(0.92).motion(Spring::SNAPPY).scale(if hot && !on { 1.08 } else { 1.0 })
                 .on_hover_change(move |s: &mut State, h, _| {
                     let cur = (course, kind, i);

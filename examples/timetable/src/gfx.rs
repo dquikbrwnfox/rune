@@ -40,6 +40,8 @@ pub struct Gfx {
     /// 0..1: the hover lamp fading in over a hot block or card, and out when nothing is.
     lamp_on: f32,
     lamp_drag: bool,
+    /// Phone layout: smaller fire.
+    small: bool,
     /// Per-frame lists, kept to reuse their allocations.
     slots: Vec<Slot>,
     prims: Vec<Prim>,
@@ -119,7 +121,7 @@ impl Gfx {
                 let flick = 0.8 + 0.2 * (t * 13.0 + x).sin() * (t * 7.3 + y).cos();
                 lights.push(Light::point(centre[0], (y + h * 0.3) * k, 120.0 * k).color(lin(0xff6a1a)).intensity(0.3 * flick).radius(18.0 * k).range(380.0 * k));
                 let n = self.night;
-                Fx::fire(FireParams { style: FireStyle::Top, height: 130.0, intensity: 0.5 + 0.8 * n, smoke: 0.08 + 0.4 * n, embers: 40, scale: 26.0, ..FireParams::default() })
+                Fx::fire(FireParams { style: FireStyle::Top, height: if self.small { 60.0 } else { 130.0 }, intensity: 0.5 + 0.8 * n, smoke: 0.08 + 0.4 * n, embers: 40, scale: 26.0, ..FireParams::default() })
             }
             mark::ARC => {
                 // Lightning between the two blocks that clash.
@@ -167,7 +169,7 @@ impl Compositor<State> for Gfx {
             k = i.params[3].max(0.01);
             if i.params[1] == KIND_EFFECT {
                 let r = i.radii.iter().fold(0.0f32, |a, v| a.max(v.abs())) / k;
-                if m == mark::LIGHTS { lights_on = i.uv[0] > 0.5; dark = i.uv[1] > 0.5; continue; }
+                if m == mark::LIGHTS { lights_on = i.uv[0] > 0.5; dark = i.uv[1] > 0.5; self.small = i.uv[2] > 0.5; continue; }
                 slots.push(Slot { n, m, r: i.rect.map(|v| v / k), rad: r, d: i.uv, k, clip: i.clip, fade: i.fade });
             } else if (m == mark::SLAB || m == mark::CARD) && i.params[1] == KIND_RECT && !is_glyph(i) && i.rect[2] > 24.0 {
                 let h = if m == mark::SLAB { 14.0 } else { 7.0 } * k;

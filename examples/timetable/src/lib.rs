@@ -10,6 +10,7 @@ mod data;
 mod gfx;
 mod grid;
 mod header;
+mod mobile;
 mod model;
 mod pal;
 mod side;
@@ -66,6 +67,13 @@ pub struct State {
     pub lights: bool,
     /// The block or card under the pointer (its key), for the hover lamp.
     pub hot: Option<String>,
+    /// Phone layout: the open tab (0 week, 1 courses), the day being swiped and which way it went.
+    pub tab: u8,
+    pub swipe: f32,
+    pub swipe_dir: i8,
+    /// Lighting follows the device (on for desktop, off for phones) until the lamp button picks.
+    pub lights_auto: bool,
+    pub shown_lights: std::cell::Cell<bool>,
     pub zoom: Option<u8>,
     pub drag: Option<Drag>,
     pub cmdk: Cmdk,
@@ -95,6 +103,11 @@ impl Default for State {
             dark: None,
             lights: true,
             hot: None,
+            tab: 0,
+            swipe: 0.0,
+            swipe_dir: 1,
+            lights_auto: true,
+            shown_lights: std::cell::Cell::new(true),
             zoom: None,
             drag: None,
             cmdk: Cmdk { open: false, edit: TextEdit::new(""), sel: 0, want_focus: 0 },
@@ -210,7 +223,7 @@ fn on_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
         Key::Escape if s.zoom.is_some() => { s.zoom = None; true }
         Key::Text(t) if t == "/" => { cmdk::open(s); true }
         Key::Text(t) if t == "t" || t == "T" => { s.dark = Some(!s.shown_dark.get()); true }
-        Key::Text(t) if t == "l" || t == "L" => { s.lights = !s.lights; true }
+        Key::Text(t) if t == "l" || t == "L" => { toggle_lights(s); true }
         Key::Text(t) if matches!(t.as_str(), "1" | "2" | "3" | "4" | "5") => {
             let d = t.parse::<u8>().unwrap_or(1) - 1;
             s.zoom = if s.zoom == Some(d) { None } else { Some(d) };
@@ -227,20 +240,39 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
     s.shown_dark.set(p.dark);
     let sess = active(&s.cat, &s.enr);
     let pairs = clash_pairs(&sess);
+    let small = mobile::is_compact(cx);
+    grid::set_compact(small);
+    // Lighting is a desktop default; phones start flat (fill-rate and battery) until you turn it on.
+    let lit = if s.lights_auto { !small } else { s.lights };
+    s.shown_lights.set(lit);
     let mut root = col().key("root").w_full().h_full().fill(p.bg)
         // paper grain under everything (drawn only with the fx feature)
         .child(rune::effect(mark::GRAIN).key("grain").effect_data([if p.dark { 0.05 } else { 0.07 }, 0.0, 0.0, 0.0])
             .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).inert())
         // the lighting switch the compositor reads
-        .child(rune::effect(mark::LIGHTS).key("lights").effect_data([if s.lights { 1.0 } else { 0.0 }, if p.dark { 1.0 } else { 0.0 }, 0.0, 0.0])
-            .pin(Some(0.0), Some(0.0), None, None).size(1.0, 1.0).inert())
-        .child(header::header(s, &p, &sess, pairs.len()))
-        .child(rune::row().w_full().grow(1.0).min_h(0.0)
-            .child(side::sidebar(s, &p))
-            .child(grid::stage(s, cx, &p, &sess, &pairs)));
+        .child(rune::effect(mark::LIGHTS).key("lights").effect_data([if lit { 1.0 } else { 0.0 }, if p.dark { 1.0 } else { 0.0 }, if small { 1.0 } else { 0.0 }, 0.0])
+            .pin(Some(0.0), Some(0.0), None, None).size(1.0, 1.0).inert());
+    if small {
+        root = mobile::body(root, s, cx, &p, &sess, &pairs);
+    } else {
+        grid::set_row_h(46.0);
+        root = root.child(header::header(s, &p, &sess, pairs.len()))
+            .child(rune::row().w_full().grow(1.0).min_h(0.0)
+                .child(side::sidebar(s, &p))
+                .child(grid::stage(s, cx, &p, &sess, &pairs)));
+    }
     if s.cmdk.open { root = root.child(cmdk::palette(s, &p)); }
     root
 }
+
+/// The lamp button and `L`: flip what's showing, and stop following the device default.
+pub fn toggle_lights(s: &mut State) {
+    s.lights = !s.shown_lights.get();
+    s.lights_auto = false;
+}
+
+/// The day a phone shows: the one picked, else today, else Monday.
+pub fn shown_day(s: &State) -> u8 { s.zoom.unwrap_or_else(|| s.clock.map_or(0, |c| c.0)) }
 
 /// A full-size absolutely-placed layer.
 pub fn layer() -> El { el().pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)) }

@@ -9,7 +9,18 @@ use crate::model::{DAYS, DAYS_LONG, END, Ghost, START, Sess, clash_set, clusters
 use crate::pal::{BODY, CODE, MONO, SMALL, TINY, TITLE, Pal, tone, tone_hex};
 use crate::{Drag, State, mark, pick};
 
-const ROW: f32 = 46.0; // points per hour
+thread_local! {
+    /// Points per hour: 46 on desktop; on a phone, whatever fits the screen.
+    static ROW_H: std::cell::Cell<f32> = const { std::cell::Cell::new(46.0) };
+}
+fn row_h() -> f32 { ROW_H.with(std::cell::Cell::get) }
+pub fn set_row_h(v: f32) { ROW_H.with(|c| c.set(v)); }
+thread_local! {
+    /// Phone layout: one day at a time, paged by the pills and by swiping.
+    static COMPACT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+pub fn compact() -> bool { COMPACT.with(std::cell::Cell::get) }
+pub fn set_compact(v: bool) { COMPACT.with(|c| c.set(v)); }
 const HEAD: f32 = 38.0;
 const GUTTER: f32 = 48.0;
 
@@ -17,7 +28,8 @@ const GUTTER: f32 = 48.0;
 static PING: [Beat; 3] = [Beat::new(0.0).opacity(0.0).scale(0.96), Beat::new(0.08).opacity(0.85).scale(1.0), Beat::new(0.7).opacity(0.0).scale(1.16)];
 
 pub fn stage(s: &State, cx: &mut Cx<State>, p: &Pal, sess: &[Sess], pairs: &[(usize, usize)]) -> El {
-    let mut st = col().key("stage").grow(1.0).h_full().min_w(0.0).min_h(0.0).padding(20.0).gap(12.0);
+    let small = compact();
+    let mut st = col().key("stage").grow(1.0).h_full().min_w(0.0).min_h(0.0).padding(if small { 10.0 } else { 20.0 }).gap(if small { 8.0 } else { 12.0 });
     if let Some(&(a, b)) = pairs.first() {
         let (a, b) = (&sess[a], &sess[b]);
         let more = if pairs.len() > 1 { format!("  +{} more", pairs.len() - 1) } else { String::new() };
@@ -25,18 +37,23 @@ pub fn stage(s: &State, cx: &mut Cx<State>, p: &Pal, sess: &[Sess], pairs: &[(us
             .fill(p.danger.alpha(0.12)).border(1.0, p.danger.alpha(0.7))
             .transition(Transition::offset(0.0, -10.0).combined(Transition::opacity()))
             .child(el().h(18.0).px(6.0).center().radius(5.0).fill(p.danger).child(text("CLASH").font(TINY).color(p.bg)))
-            .child(text(format!("{} {} and {} {} overlap on {} at {}.{more}",
-                s.cat[a.course].code, kind_name(a.kind), s.cat[b.course].code, kind_name(b.kind), DAYS_LONG[a.day as usize], tm(a.start.max(b.start))))
-                .font(BODY).color(p.text).grow(1.0).truncate())
-            .child(text("Drag a block onto a ghost to fix it").font(SMALL).color(p.sub)));
+            .child({
+                let msg = text(format!("{} {} and {} {} overlap on {} at {}.{more}",
+                    s.cat[a.course].code, kind_name(a.kind), s.cat[b.course].code, kind_name(b.kind), DAYS_LONG[a.day as usize], tm(a.start.max(b.start))))
+                    .font(BODY).color(p.text).grow(1.0).min_w(0.0);
+                if small { msg.wrap() } else { msg.truncate() }
+            })
+            .child(if small { el() } else { text("Drag a block onto a ghost to fix it").font(SMALL).color(p.sub) }));
     }
     st = st.child(grid(s, cx, p, sess, pairs));
-    st = st.child(row().key("hints").gap(18.0).center_y()
-        .child(hint(p, "Drag", "a tutorial or lab onto a ghost"))
-        .child(hint(p, "1–5", "zoom a day"))
-        .child(hint(p, "T", "theme"))
-        .child(hint(p, "L", "lights"))
-        .child(hint(p, "/", "find a course")));
+    if !small {
+        st = st.child(row().key("hints").gap(18.0).center_y()
+            .child(hint(p, "Drag", "a tutorial or lab onto a ghost"))
+            .child(hint(p, "1–5", "zoom a day"))
+            .child(hint(p, "T", "theme"))
+            .child(hint(p, "L", "lights"))
+            .child(hint(p, "/", "find a course")));
+    }
     // Lightning arcs between the first pair that clash, for as long as they do.
     if let Some(&(a, b)) = pairs.first() {
         let mid = |id: &str| cx.layout(id).map(|r| [r[0] + r[2] * 0.5, r[1] + r[3] * 0.5]);
@@ -65,15 +82,15 @@ fn hint(p: &Pal, key: &str, what: &str) -> El {
 fn kind_name(k: u8) -> &'static str { ["lecture", "tutorial", "lab"][k as usize] }
 
 fn grid(s: &State, cx: &mut Cx<State>, p: &Pal, sess: &[Sess], pairs: &[(usize, usize)]) -> El {
-    let body_h = (END - START) * ROW;
+    let body_h = (END - START) * row_h();
     let mut labels = el().w_full().h(body_h);
     for h in (START as i32 + 1)..(END as i32) {
-        labels = labels.child(text(format!("{h:02}:00")).font(MONO).color(p.sub).absolute(6.0, (h as f32 - START) * ROW - 7.0));
+        labels = labels.child(text(format!("{h:02}:00")).font(MONO).color(p.sub).absolute(6.0, (h as f32 - START) * row_h() - 7.0));
     }
     let gutter = col().key("gutter").w(GUTTER).child(el().h(HEAD)).child(labels);
 
     let gh = ghosts(&s.cat, &s.enr, &clash_set(&s.cat, &s.enr));
-    let days: Vec<u8> = match s.zoom { Some(d) => vec![d], None => (0..5).collect() };
+    let days: Vec<u8> = match s.zoom { Some(d) => vec![d], None if compact() => vec![crate::shown_day(s)], None => (0..5).collect() };
     let cw = cx.layout_size(&format!("daybody-{}", days[0])).map_or(160.0, |x| x[0]);
     let target = s.drag.as_ref().and_then(|d| drop_target(s, d));
 
@@ -91,22 +108,40 @@ fn grid(s: &State, cx: &mut Cx<State>, p: &Pal, sess: &[Sess], pairs: &[(usize, 
 
 #[allow(clippy::too_many_arguments)]
 fn day_col(s: &State, p: &Pal, d: u8, sess: &[Sess], pairs: &[(usize, usize)], gh: &[Ghost], cw: f32, target: Option<usize>) -> El {
-    let body_h = (END - START) * ROW;
+    let body_h = (END - START) * row_h();
     let today = s.clock.is_some_and(|c| c.0 == d);
-    let zoomed = s.zoom == Some(d);
+    let zoomed = s.zoom == Some(d) || compact();
     let label = if zoomed { DAYS_LONG[d as usize] } else { DAYS[d as usize] };
-    let head = row().key(format!("dh-{d}")).w_full().h(HEAD).gap(6.0).center().hover(p.hover).press_scale(0.97)
-        .on_press(move |s: &mut State| s.zoom = if s.zoom == Some(d) { None } else { Some(d) })
+    let small = compact();
+    let mut head = row().key(format!("dh-{d}")).w_full().h(HEAD).gap(6.0).center()
         .child(text(label).font(TITLE).color(if today { p.brass } else { p.text }))
         .child(if today { el().key("today-pill").h(16.0).px(5.0).center().radius(4.0).fill(p.brass).child(text("TODAY").font(TINY).color(p.bg)) } else { el() })
-        .child(if zoomed { text("Esc").font(SMALL).color(p.sub) } else { el() });
+        .child(if zoomed && !small { text("Esc").font(SMALL).color(p.sub) } else { el() });
+    if !small {
+        head = head.hover(p.hover).press_scale(0.97).on_press(move |s: &mut State| s.zoom = if s.zoom == Some(d) { None } else { Some(d) });
+    }
 
     let mut body = el().key(format!("daybody-{d}")).w_full().h(body_h).border(1.0, p.sep.alpha(0.0));
+    if small {
+        // Swipe the day sideways to page to the next or previous one; it follows the finger, then springs.
+        body = body.offset(s.swipe, 0.0).offset_motion(Spring::new(0.4, 0.15))
+            .on_drag(move |s: &mut State, g: &mut rune::Drag, tx: &mut Tx| match g.phase {
+                Phase::Down => {}
+                Phase::Move => { if g.dx.abs() > g.dy.abs() { tx.instant(); s.swipe = g.dx * 0.85; } }
+                Phase::Up => {
+                    let step = if g.cancelled() || g.dx.abs() < 64.0 || g.dx.abs() < g.dy.abs() { 0 } else if g.dx < 0.0 { 1 } else { -1 };
+                    let next = (i32::from(d) + step).clamp(0, 4) as u8;
+                    s.zoom = Some(next);
+                    s.swipe = 0.0;
+                    s.swipe_dir = step as i8;
+                }
+            });
+    }
     if today {
         body = body.linear_gradient(PI, [(0.0, p.brass.alpha(0.12)), (0.6, p.brass.alpha(0.04)), (1.0, p.brass.alpha(0.0))]);
     }
     for h in 0..(END - START) as i32 {
-        body = body.child(el().w_full().h(1.0).fill(p.sep).absolute(0.0, h as f32 * ROW));
+        body = body.child(el().w_full().h(1.0).fill(p.sep).absolute(0.0, h as f32 * row_h()));
     }
     body = body.child(el().pin(Some(0.0), Some(0.0), None, Some(0.0)).w(1.0).fill(p.sep));
 
@@ -131,22 +166,26 @@ fn day_col(s: &State, p: &Pal, d: u8, sess: &[Sess], pairs: &[(usize, usize)], g
         let (a, b) = (&sess[a], &sess[b]);
         if a.day != d { continue; }
         let (top, bot) = (a.start.max(b.start), a.end().min(b.end()));
-        let hh = (bot - top) * ROW;
+        let hh = (bot - top) * row_h();
         let mut sh = Shape::new().view_box(100.0, hh);
         let mut x = -hh;
         while x < 100.0 { sh = sh.stroke(vec![[x, hh], [x + hh, 0.0]], 1.4, p.danger.alpha(0.55)); x += 9.0; }
-        body = body.child(canvas(sh).key(format!("hatch-{}-{}", a.id, b.id)).pin(Some(2.0), Some((top - START) * ROW), Some(2.0), None).h(hh)
+        body = body.child(canvas(sh).key(format!("hatch-{}-{}", a.id, b.id)).pin(Some(2.0), Some((top - START) * row_h()), Some(2.0), None).h(hh)
             .clip_rounded(6.0).inert().transition(Transition::reveal(Edge::Top)));
     }
     if let Some((cd, h)) = s.clock {
         if cd == d && (START..END).contains(&h) {
-            body = body.child(el().key("now").pin(Some(0.0), Some((h - START) * ROW - 1.0), Some(0.0), None).h(2.0).fill(p.danger).inert()
+            body = body.child(el().key("now").pin(Some(0.0), Some((h - START) * row_h() - 1.0), Some(0.0), None).h(2.0).fill(p.danger).inert()
                 .child(el().key("now-dot").size(10.0, 10.0).radius(5.0).fill(p.danger).absolute(-5.0, -4.0)
                     .looping(LoopSpec::opacity(1.8, 0.0, 0.35, 1.0))));
         }
     }
-    col().key(format!("col-{d}")).grow(1.0).min_w(0.0)
-        .transition(Transition::scale(0.96).combined(Transition::opacity()))
+    // On a phone the next day slides in from the side you swiped toward and the old one slides out.
+    let enter = if small { Transition::asymmetric(
+        Transition::offset(60.0 * f32::from(s.swipe_dir), 0.0).combined(Transition::opacity()),
+        Transition::offset(-60.0 * f32::from(s.swipe_dir), 0.0).combined(Transition::opacity()),
+    ) } else { Transition::scale(0.96).combined(Transition::opacity()) };
+    col().key(format!("col-{d}")).grow(1.0).min_w(0.0).transition(enter)
         .child(head).child(body)
 }
 
@@ -154,12 +193,12 @@ fn cluster_el(cl: &crate::model::Cluster, key: String, items: &[Sess], mut make:
     let mut lanes: Vec<El> = (0..cl.lanes).map(|_| col().grow(1.0).min_w(0.0).h_full()).collect();
     for &(i, lane) in &cl.items {
         let sx = &items[i];
-        let top = (sx.start - cl.start) * ROW + 1.0;
-        let e = make(i).pin(Some(0.0), Some(top), Some(0.0), None).h(sx.hours * ROW - 2.0);
+        let top = (sx.start - cl.start) * row_h() + 1.0;
+        let e = make(i).pin(Some(0.0), Some(top), Some(0.0), None).h(sx.hours * row_h() - 2.0);
         lanes[lane] = std::mem::replace(&mut lanes[lane], col()).child(e);
     }
     let mut r = row().key(format!("{key}-{}", cl.start)).gap(3.0)
-        .pin(Some(3.0), Some((cl.start - START) * ROW), Some(3.0), None).h((cl.end - cl.start) * ROW);
+        .pin(Some(3.0), Some((cl.start - START) * row_h()), Some(3.0), None).h((cl.end - cl.start) * row_h());
     for l in lanes { r = r.child(l); }
     r
 }
@@ -169,7 +208,7 @@ fn cluster_el(cl: &crate::model::Cluster, key: String, items: &[Sess], mut make:
 fn drop_target(s: &State, d: &Drag) -> Option<usize> {
     let c = &s.cat[d.course];
     let day = (f32::from(d.day) + (d.dx / d.cw).round()).clamp(0.0, 4.0) as u8;
-    let hour = d.start + d.dy / ROW;
+    let hour = d.start + d.dy / row_h();
     let mut best: Option<(usize, f32)> = None;
     for (i, st) in streams(c, d.kind).iter().enumerate() {
         if i == d.stream { continue; }
@@ -204,7 +243,7 @@ fn block_el(s: &State, p: &Pal, x: &Sess, clash: bool, narrow: bool, wide: bool,
             .child(el().grow(1.0))
             .child(if narrow || cw < 125.0 { el() } else { text(if x.kind == 0 { kind.to_owned() } else { format!("{kind} {sid}") }).font(TINY).color(edge.alpha(0.85)) }))
         .child(text(format!("{}–{}", tm(x.start), tm(x.end()))).font(MONO).color(p.text).truncate());
-    if wide {
+    if wide && x.hours * row_h() >= 60.0 {
         // Zoomed: there's width to spare, so name and room share one line.
         inner = inner.child(row().w_full().gap(8.0).child(text(c.name).font(SMALL).color(p.text).truncate().shrink())
             .child(text(format!("· {}", x.room)).font(SMALL).color(p.sub)));
