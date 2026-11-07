@@ -1,0 +1,2 @@
+- rune-fx builds for the web next to Rune's WebGPU backend: pipeline compilation no longer requires a `Sync` device on wasm32, where wgpu's device isn't `Sync` and compilation runs serially.
+- Web: a window with a compositor now records effect slot marks (`Runtime::track_marks`), as desktop windows do, so `rt.marks` tells a compositor's slots apart instead of reading 0 for all of them.

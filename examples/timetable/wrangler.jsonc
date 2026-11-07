@@ -1,0 +1,11 @@
+// The web build as a static-assets Cloudflare Worker (no Worker code, so it runs on the free plan).
+// Build first: `bash scripts/web-build.sh timetable --opt --out target/web-tt` from the repo root,
+// then from this folder: `npx wrangler deploy`.
+{
+  "$schema": "https://unpkg.com/wrangler@4/config-schema.json",
+  "name": "rune-timetable",
+  "compatibility_date": "2026-11-01",
+  "assets": {
+    "directory": "../../target/web-tt"
+  }
+}

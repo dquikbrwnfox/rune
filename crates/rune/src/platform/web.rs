@@ -438,6 +438,8 @@ impl<S: 'static> ApplicationHandler<Wake> for Browser<S> {
             rt.set_tab_visits_controls(tab_visits_controls);
             rt.set_srgb_blend(srgb_blend);
             rt.set_font_smoothing(font_smoothing);
+            // A compositor reads `rt.marks` to tell its effect slots apart, as on desktop.
+            rt.track_marks = compositor.is_some();
             rt.set_os_drag(false);
             let now = Instant::now();
             rt.wall_start = Some(now);
