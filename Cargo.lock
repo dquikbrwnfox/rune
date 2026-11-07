@@ -4151,7 +4151,11 @@ dependencies = [
  "rune-fx",
  "rune-kit",
  "rune-light",
+ "serde",
+ "serde_json",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
  "wgpu",
 ]
 

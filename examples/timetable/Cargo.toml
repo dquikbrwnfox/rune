@@ -18,10 +18,14 @@ rune-kit = { path = "../../crates/rune-kit" }
 rune-fx = { path = "../../crates/rune-fx", optional = true }
 rune-light = { path = "../../crates/rune-light", optional = true }
 wgpu = { version = "30", default-features = false, optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
 js-sys = "0.3"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlElement", "HtmlAnchorElement", "Node", "Location", "History", "Storage", "Blob", "BlobPropertyBag", "Url", "Response", "console"] }
 
 [lints]
 workspace = true

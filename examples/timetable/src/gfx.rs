@@ -2,7 +2,7 @@
 //! it into the window: course blocks and cards stand up as slabs that cast soft shadows, a warm lamp
 //! comes up over the block or card you hover or drag, with god rays streaming past it, a low sun rakes across
 //! the paper by day, fire on a clash lights the week orange, and a lock-in flashes. rune-fx layers
-//! (fire, lightning, sparkles, glow, aurora, ripple, liquid metal) are drawn over the lit frame.
+//! (fire, lightning, sparkles, glow, aurora, ripple) are drawn over the lit frame.
 //!
 //! One-shot effects carry a sequence number in their slot data: the first frame that sees a new one
 //! stamps its start, and the compositor asks for frames only while something is still moving.
@@ -76,10 +76,6 @@ impl Gfx {
         let shape = Shape::rounded(x, y, w, h, s.rad);
         let centre = [(x + w * 0.5) * k, (y + h * 0.5) * k];
         let fx = match s.m {
-            mark::SEAL => {
-                self.stamp(s.m, d[0] as u32, t, 3.5);
-                Fx::fill(LiquidMetalParams { speed: 0.7, ..LiquidMetalParams::gold() })
-            }
             mark::SHOCK => {
                 let seq = d[2] as u32;
                 if seq == 0 { return None; }
@@ -113,7 +109,7 @@ impl Gfx {
                 let t0 = self.stamp(s.m, d[0] as u32, t, 3.0);
                 let a = ((t - t0) / 0.5).min(1.0) * (1.0 - ((t - t0 - 1.8) / 1.2).clamp(0.0, 1.0));
                 if a <= 0.0 { return None; }
-                Fx::aurora(AuroraParams { intensity: (0.22 + 0.4 * self.night) * a, speed: 0.6, ..Default::default() })
+                Fx::aurora(AuroraParams { intensity: (0.12 + 0.28 * self.night) * a, speed: 0.6, ..Default::default() })
             }
             mark::FIRE => {
                 // A clash burns until it's fixed, and its firelight flickers over the week.
@@ -121,7 +117,7 @@ impl Gfx {
                 let flick = 0.8 + 0.2 * (t * 13.0 + x).sin() * (t * 7.3 + y).cos();
                 lights.push(Light::point(centre[0], (y + h * 0.3) * k, 120.0 * k).color(lin(0xff6a1a)).intensity(0.3 * flick).radius(18.0 * k).range(380.0 * k));
                 let n = self.night;
-                Fx::fire(FireParams { style: FireStyle::Top, height: if self.small { 60.0 } else { 130.0 }, intensity: 0.5 + 0.8 * n, smoke: 0.08 + 0.4 * n, embers: 40, scale: 26.0, ..FireParams::default() })
+                Fx::fire(FireParams { style: FireStyle::Top, height: if self.small { 30.0 } else { 46.0 }, intensity: 0.5 + 0.8 * n, smoke: 0.08 + 0.4 * n, embers: 14, scale: 26.0, ..FireParams::default() })
             }
             mark::ARC => {
                 // Lightning between the two blocks that clash.
@@ -163,16 +159,16 @@ impl Compositor<State> for Gfx {
         slots.clear();
         prims.clear();
         let (mut lights_on, mut dark) = (false, false);
-        let mut k = 1.0;
+        // Device scale comes from the effect slots only: `params[3]` of other instances is not a scale.
+        let k = f.rt.instances.iter().find(|i| i.params[1] == KIND_EFFECT).map_or(1.0, |i| i.params[3].max(0.01));
         for (n, i) in f.rt.instances.iter().enumerate() {
             let m = f.rt.marks.get(n).copied().unwrap_or(0) & 0xff;
-            k = i.params[3].max(0.01);
             if i.params[1] == KIND_EFFECT {
                 let r = i.radii.iter().fold(0.0f32, |a, v| a.max(v.abs())) / k;
                 if m == mark::LIGHTS { lights_on = i.uv[0] > 0.5; dark = i.uv[1] > 0.5; self.small = i.uv[2] > 0.5; continue; }
                 slots.push(Slot { n, m, r: i.rect.map(|v| v / k), rad: r, d: i.uv, k, clip: i.clip, fade: i.fade });
             } else if (m == mark::SLAB || m == mark::CARD) && i.params[1] == KIND_RECT && !is_glyph(i) && i.rect[2] > 24.0 {
-                let h = if m == mark::SLAB { 14.0 } else { 7.0 } * k;
+                let h = match (m == mark::SLAB, self.small) { (true, false) => 14.0, (false, false) => 7.0, (true, true) => 7.0, (false, true) => 4.0 } * k;
                 prims.push(Prim::from_rune(i.rect, i.radii).raised(h).bevel(3.0 * k, 2.0 * k).gloss(0.55, 0.35));
             }
         }
@@ -183,7 +179,9 @@ impl Compositor<State> for Gfx {
         let goal = if dark { 1.0 } else { 0.0 };
         self.night += (goal - self.night) * (1.0 - (-dt * 3.0).exp());
         if (goal - self.night).abs() > 0.002 { self.live = true } else { self.night = goal }
-        let target = slots.iter().find(|s| s.m == mark::LAMP).map(|s| {
+        // Touch has no hover-out, so on a phone the lamp only comes up while a block is being dragged.
+        let small = self.small;
+        let target = slots.iter().find(|s| s.m == mark::LAMP && (!small || s.d[0] > 0.5)).map(|s| {
             let [x, y, sw, sh] = s.r;
             ([(x + sw * 0.5) * s.k, (y + sh * 0.5) * s.k], s.d[0] > 0.5)
         });
@@ -209,10 +207,13 @@ impl Compositor<State> for Gfx {
             if day > 0.01 {
                 // Low afternoon sun from the upper left; it sinks to the right as night falls.
                 let sx = -0.15 * w + night * 1.3 * w;
-                lights.push(Light::point(sx, -0.35 * h, 520.0 * k).color(lin(0xffdca0)).intensity(24.0 * day).radius(28.0 * k).range(8000.0 * k).shafts(0.55 * day).specular(0.7));
+                // A tall narrow screen: keep the sun close to the top edge, higher and with soft shafts, so shadows stay short.
+                let (sy, sz, sh, si) = if self.small { (-0.12 * h, 700.0, 0.2, 12.0) } else { (-0.35 * h, 520.0, 0.55, 24.0) };
+                lights.push(Light::point(sx, sy, sz * k).color(lin(0xffdca0)).intensity(si * day).radius(28.0 * k).range(8000.0 * k).shafts(sh * day).specular(0.7));
             }
             if night > 0.01 {
-                lights.push(Light::point(0.92 * w, -0.4 * h, 1000.0 * k).color(lin(0x8fa8ff)).intensity(9.0 * night).radius(90.0 * k).range(8000.0 * k).shafts(0.35 * night));
+                let (my, ms, mi) = if self.small { (-0.12 * h, 0.1, 5.0) } else { (-0.4 * h, 0.35, 9.0) };
+                lights.push(Light::point(0.92 * w, my, 1000.0 * k).color(lin(0x8fa8ff)).intensity(mi * night).radius(90.0 * k).range(8000.0 * k).shafts(ms * night));
             }
             if lamp_on > 0.01 {
                 // Brighter and lower while dragging, so the lifted block throws a long shadow.
@@ -303,10 +304,11 @@ impl Gfx {
             });
             lit.cleared = true;
         }
+        let phone = self.small;
         let settings = if night > 0.5 {
-            Settings { ambient: [0.3, 0.31, 0.36], rim: 0.9, contact_ao: 0.5, shafts_over: 0.55, albedo_floor: 0.06, background_gloss: 0.5, time: t, ..Default::default() }
+            Settings { ambient: if phone { [0.36, 0.37, 0.42] } else { [0.3, 0.31, 0.36] }, rim: 0.9, contact_ao: 0.5, shafts_over: if phone { 0.12 } else { 0.55 }, albedo_floor: 0.06, background_gloss: if phone { 0.2 } else { 0.5 }, time: t, ..Default::default() }
         } else {
-            Settings { ambient: [0.68, 0.66, 0.64], rim: 0.8, contact_ao: 0.25, shafts_over: 0.45, albedo_floor: 0.03, time: t, ..Default::default() }
+            Settings { ambient: if phone { [0.92, 0.9, 0.88] } else { [0.68, 0.66, 0.64] }, rim: 0.8, contact_ao: 0.25, shafts_over: if phone { 0.08 } else { 0.45 }, albedo_floor: 0.03, background_gloss: if phone { 0.1 } else { 0.4 }, time: t, ..Default::default() }
         };
         let drawn = lit.light.render(device, queue, f.encoder, &LightScene { prims: &prims, lights: &lights, settings, emission: None }, &lit.base, &lit.text, f.target);
         if !drawn { return; }
