@@ -163,7 +163,7 @@ build_once() {
     # Rune's default fonts embed Inter cut to Latin, Greek and Cyrillic text and fetch the full faces from beside
     # app.js once the first frame is up: copy those of the Rune this build embedded the cut from.
     local cut
-    cut=$(tr ' ' '\n' < "${artifact%.wasm}.d" 2>/dev/null | grep -m1 '/assets/web/first/Inter-Regular\.ttf$' || true)
+    cut=$(tr ' ' '\n' < "${artifact%.wasm}.d" 2>/dev/null | tr '\\' '/' | grep -m1 '/assets/web/first/Inter-Regular\.ttf$' || true)
     if [[ -n $cut ]]; then cp "${cut%/first/*}"/Inter-*.ttf "$next/"; fi
     local entry
     for entry in "$next"/*; do
