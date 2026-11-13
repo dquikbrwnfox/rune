@@ -7,8 +7,10 @@
 //! rune_kit::Button::new("Save").build(k)
 //! ```
 
+pub mod app_icons;
 pub mod file_icons;
 pub mod icons;
+pub mod new_icons;
 pub mod provider_icons;
 pub mod tree_icons;
 
@@ -36,8 +38,14 @@ pub const FAMILIES: (&str, &str) = ("Inter", "IBM Plex Mono");
 pub fn theme(dark: bool) -> &'static Theme {
     static DARK: OnceLock<Theme> = OnceLock::new();
     static LIGHT: OnceLock<Theme> = OnceLock::new();
-    let load = || Theme::from_json(THEME, dark).unwrap_or_else(|e| panic!("{e}"));
+    let load = || Theme::from_value(document(), dark).unwrap_or_else(|e| panic!("{e}"));
     if dark { DARK.get_or_init(load) } else { LIGHT.get_or_init(load) }
+}
+
+/// `theme.json`, parsed once for both appearances and the kit's shadows.
+fn document() -> &'static Value {
+    static DOC: OnceLock<Value> = OnceLock::new();
+    DOC.get_or_init(|| serde_json::from_str(THEME).expect("theme.json"))
 }
 
 /// The brand's hot colour for one appearance: ember step 9, for marks like a logo or a
@@ -63,16 +71,11 @@ pub fn scale(name: &str, dark: bool, step: u8) -> Color {
     theme(dark).color(&format!("{name}-{}-{step}", if dark { "dark" } else { "light" }))
 }
 
-/// The theme without sRGB re-solving: translucent tokens keep their authored alpha.
-fn raw_theme(dark: bool) -> &'static Theme {
-    static DARK: OnceLock<Theme> = OnceLock::new();
-    static LIGHT: OnceLock<Theme> = OnceLock::new();
-    let load = || {
-        let mut v: Value = serde_json::from_str(THEME).expect("theme.json");
-        v.as_object_mut().expect("theme object").remove("blend");
-        Theme::from_json(&v.to_string(), dark).unwrap_or_else(|e| panic!("{e}"))
-    };
-    if dark { DARK.get_or_init(load) } else { LIGHT.get_or_init(load) }
+/// Token `name` as the theme authors it, without sRGB re-solving: translucent tokens keep their
+/// authored alpha.
+#[track_caller]
+fn authored(dark: bool, name: &str) -> Color {
+    theme(dark).authored(name).unwrap_or_else(|| panic!("theme.json has no {name:?}"))
 }
 
 /// The kit tokens for one appearance, resolved for the blend mode of the window building the
@@ -104,7 +107,7 @@ fn build(dark: bool) -> Kit {
     let t = theme(dark);
     let c = |n: &str| t.color(n);
     let v = |n: &str| t.color(&format!("v2-{n}"));
-    let raw = |n: &str| raw_theme(dark).color(&format!("v2-{n}"));
+    let raw = |n: &str| authored(dark, &format!("v2-{n}"));
     let state = |n: &str, icon: Color| StateColors {
         bg: v(&format!("state-bg-{n}")),
         fg: v(&format!("state-fg-{n}")),
@@ -113,7 +116,7 @@ fn build(dark: bool) -> Kit {
     };
     let blend = v("background-bg-base");
     let solve = |x: Color| rune::theme::for_blend(x, blend);
-    let data: Value = serde_json::from_str(THEME).expect("theme.json");
+    let data = document();
     let mode = if dark { "dark" } else { "light" };
     let sh = |n: &str| {
         let src = data["shadows"][mode][n].as_str().unwrap_or_else(|| panic!("theme.json has no {mode} shadow {n:?}"));
@@ -193,22 +196,18 @@ fn build(dark: bool) -> Kit {
         std_icon_strong: c("icon-strong-base"),
         std_text: c("text-base"),
     };
-    let elevation = Elevation {
-        raised: sh("v2-elevation-raised"),
-        floating: sh("v2-elevation-floating"),
-        overlay: sh("v2-elevation-overlay"),
-        button_neutral: sh("v2-elevation-button-neutral"),
-        button_contrast: sh("v2-elevation-button-contrast"),
-        elements: sh("v2-elevation-elements"),
-        switch_off: sh("v2-elevation-switch-off"),
-        switch_on: sh("v2-elevation-switch-on"),
-        md: sh("shadow-md"),
-        // switch.css, standard appearance: rgba(19, 16, 16, .04/.06/.08).
-        knob: css::box_shadows(
-            "#1310100a 0px 1px 2px -1px, #1310100f 0px 1px 2px 0px, #13101014 0px 1px 3px 0px",
-            solve,
-        ),
-    };
+    let mut elevation = Elevation::default().with_input(sh("v2-elevation-input"));
+    elevation.raised = sh("v2-elevation-raised");
+    elevation.floating = sh("v2-elevation-floating");
+    elevation.overlay = sh("v2-elevation-overlay");
+    elevation.button_neutral = sh("v2-elevation-button-neutral");
+    elevation.button_contrast = sh("v2-elevation-button-contrast");
+    elevation.elements = sh("v2-elevation-elements");
+    elevation.switch_off = sh("v2-elevation-switch-off");
+    elevation.switch_on = sh("v2-elevation-switch-on");
+    elevation.md = sh("shadow-md");
+    // switch.css, standard appearance: rgba(19, 16, 16, .04/.06/.08).
+    elevation.knob = css::box_shadows("#1310100a 0px 1px 2px -1px, #1310100f 0px 1px 2px 0px, #13101014 0px 1px 3px 0px", solve);
     // `line-height-large` is 150%; the older text styles derive their line from it.
     let ty = Type {
         ui: inter(13.0, 440.0, 20.0, -0.04),
@@ -252,7 +251,10 @@ mod tests {
         for id in NAMES {
             let icon = named(id).unwrap_or_else(|| panic!("no mark for {id}"));
             assert_eq!(icon.name, *id);
-            assert!(icon.view > 0.0 && icon.body.contains("currentColor"), "{id} takes the text colour");
+            // A few marks paint in their own colours, as Desktop draws them.
+            let paints = icon.body.contains("currentColor") || icon.body.contains("fill=\"#");
+            assert!(icon.view > 0.0 && paints, "{id} takes the text colour or its own");
+            assert!(!icon.body.contains("transform") && !icon.body.contains("<g"), "{id} is flat");
         }
         assert!(named("not-a-provider").is_none());
         assert_eq!(FALLBACK.name, "synthetic");
@@ -274,7 +276,7 @@ mod tests {
         for dark in [false, true] {
             let srgb = rune::theme::with_blend(true, || super::kit(dark));
             let linear = rune::theme::with_blend(false, || super::kit(dark));
-            let authored = super::raw_theme(dark).color("v2-overlay-simple-overlay-hover");
+            let authored = super::authored(dark, "v2-overlay-simple-overlay-hover");
             assert_eq!(srgb.c.hover, authored, "sRGB blending paints the authored alpha");
             assert_eq!(linear.c.hover, rune::theme::srgb_equivalent(authored, linear.c.bg_base));
             assert_ne!(linear.c.hover.a, authored.a);

@@ -116,6 +116,8 @@ pub(super) struct Builder {
     autolink: bool,
     image_starts: Vec<usize>,
     image_ranges: Vec<(usize, usize)>,
+    /// Each open image's source and title, beside `image_starts`.
+    image_dests: Vec<(String, String)>,
     tail: Tail,
 }
 
@@ -248,7 +250,7 @@ impl Builder {
             for o in open {
                 end_run(&mut inl, o);
             }
-            let trimmed = inl.text.trim_end().len();
+            let trimmed = trimmed_len(&inl);
             inl.text.truncate(trimmed);
             map.truncate_out(trimmed);
             inl.spans.retain_mut(|s| {
@@ -309,6 +311,42 @@ impl Builder {
         }
     }
 
+    /// Lifts the image whose alt text is `start..end` of the paragraph being read out into a
+    /// [`Block::Image`] of its own, the text before it ending a paragraph and the text after it
+    /// starting one. An image in a heading, a table cell, a link or emphasis stays in the line.
+    fn lift_image(&mut self, start: usize, end: usize, src: String, title: String) -> bool {
+        let Some((InlineKind::Para, inl, open, map)) = self.inline.as_mut() else { return false };
+        // An image still arriving (no source yet) stays its alt text until it is whole.
+        if !open.is_empty() || end > inl.text.len() || src.is_empty() {
+            return false;
+        }
+        let alt = inl.text[start..end].to_owned();
+        let mut alt_map = SpanMap::default();
+        for (src, out) in &map.0 {
+            let overlap = start.max(out.start)..end.min(out.end);
+            if !overlap.is_empty() {
+                let source = if src.len() == out.len() {
+                    src.start + (overlap.start - out.start)..src.start + (overlap.end - out.start)
+                } else { src.clone() };
+                alt_map.push(source, overlap.start - start..overlap.end - start);
+            }
+        }
+        inl.text.truncate(start);
+        inl.spans.retain_mut(|s| {
+            s.1 = s.1.min(start);
+            s.0 < s.1
+        });
+        inl.links.retain_mut(|s| {
+            s.1 = s.1.min(start);
+            s.0 < s.1
+        });
+        map.truncate_out(start);
+        self.flush_inline();
+        self.push(Block::Image { src, alt, title }, BlockMap::Inline(alt_map));
+        self.inline = Some((InlineKind::Para, Inline::default(), Vec::new(), SpanMap::default()));
+        true
+    }
+
     fn table(&mut self) -> Option<(&mut Table, &mut Vec<Inline>, &mut Vec<SpanMap>, &mut Vec<Vec<SpanMap>>, &mut Vec<SpanMap>)> {
         match self.stack.last_mut() {
             Some((Container::Table(t, cells, head, rows, cell_maps), _, _)) => Some((t, cells, head, rows, cell_maps)),
@@ -318,6 +356,27 @@ impl Builder {
 }
 
 pub(super) const PAD: &str = "\u{202f}\u{202f}";
+/// Inline code's padding before it, ending in a left-to-right isolate (LRI), and after it,
+/// starting with its end (PDI): `markdown.css` sets `:not(pre) > code { direction: ltr;
+/// unicode-bidi: isolate }`, so code reads left to right and moves as one inside Arabic text.
+pub(super) const OPEN: &str = "\u{202f}\u{202f}\u{2066}";
+pub(super) const CLOSE: &str = "\u{2069}\u{202f}\u{202f}";
+
+/// `text` without inline code's padding and isolates.
+pub(super) fn unpadded(text: &str) -> String {
+    text.replace(OPEN, "").replace(CLOSE, "")
+}
+
+/// `inl`'s text without its trailing whitespace and, when inline code ends it, the rest of that
+/// code's padding: the line's end closes the isolate, so text that ends in code is a prefix of
+/// the same text with more after the code, as a stream needs.
+fn trimmed_len(inl: &Inline) -> usize {
+    let text = inl.text.trim_end();
+    match text.strip_suffix('\u{2069}') {
+        Some(rest) if inl.spans.iter().any(|s| s.2 == Style::CodePad && s.0 == rest.len()) => rest.trim_end().len(),
+        _ => text.len(),
+    }
+}
 
 /// Source byte range of the inner code text inside a backtick code span `src[range]`.
 fn code_span_content_range(src: &str, range: Range<usize>, rendered: &str) -> Range<usize> {
@@ -401,6 +460,7 @@ pub(super) fn parse_doc_tail(src: &str, autolink: bool) -> (ParsedDoc, Tail) {
         autolink,
         image_starts: Vec::new(),
         image_ranges: Vec::new(),
+        image_dests: Vec::new(),
         tail: Tail::None,
     };
     let opts = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
@@ -509,9 +569,10 @@ pub(super) fn parse_doc_tail(src: &str, autolink: bool) -> (ParsedDoc, Tail) {
                 Tag::Emphasis => open(&mut b, Style::Em, None),
                 Tag::Strikethrough => open(&mut b, Style::Strike, None),
                 Tag::Link { dest_url, .. } => open(&mut b, Style::Link, Some(dest_url.into_string())),
-                Tag::Image { .. } => {
+                Tag::Image { dest_url, title, .. } => {
                     let start = b.inline().1.text.len();
                     b.image_starts.push(start);
+                    b.image_dests.push((dest_url.into_string(), title.into_string()));
                 }
                 _ => {}
             },
@@ -541,7 +602,10 @@ pub(super) fn parse_doc_tail(src: &str, autolink: bool) -> (ParsedDoc, Tail) {
                 TagEnd::Image => {
                     if let Some(start) = b.image_starts.pop() {
                         let end = b.inline().1.text.len();
-                        b.image_ranges.push((start, end));
+                        let (src, title) = b.image_dests.pop().unwrap_or_default();
+                        if !b.lift_image(start, end, src, title) {
+                            b.image_ranges.push((start, end));
+                        }
                     }
                 }
                 _ => {}
@@ -562,11 +626,11 @@ pub(super) fn parse_doc_tail(src: &str, autolink: bool) -> (ParsedDoc, Tail) {
                 let code_src = code_span_content_range(src, range, &t);
                 let inl = b.inline();
                 let a = inl.1.text.len();
-                inl.1.text.push_str(PAD);
+                inl.1.text.push_str(OPEN);
                 let start = inl.1.text.len();
                 inl.1.text.push_str(&t);
                 let end = inl.1.text.len();
-                inl.1.text.push_str(PAD);
+                inl.1.text.push_str(CLOSE);
                 inl.1.spans.push((a, start, Style::CodePad));
                 inl.1.spans.push((start, end, Style::Code));
                 inl.1.spans.push((end, inl.1.text.len(), Style::CodePad));
@@ -574,6 +638,10 @@ pub(super) fn parse_doc_tail(src: &str, autolink: bool) -> (ParsedDoc, Tail) {
             }
             Event::SoftBreak => {
                 let inl = b.inline();
+                // The line after an image starts the paragraph that follows it.
+                if inl.1.text.is_empty() {
+                    continue;
+                }
                 let start = inl.1.text.len();
                 inl.1.text.push(' ');
                 inl.3.push(range, start..inl.1.text.len());

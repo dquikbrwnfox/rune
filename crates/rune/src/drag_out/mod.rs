@@ -5,12 +5,14 @@
 //! URLs, PNG data, plain text) and shows a [`DragImage`], by default a snapshot of the element
 //! as the window last drew it, starting exactly over the element. [`crate::El::on_drag_start`]
 //! and [`crate::El::on_drag_end`] bracket the session, so the app can style the source while
-//! it's dragged; [`DragOutcome`] says how the drop ended. Rune windows take no drops, so a drag
-//! let go over the app ends [`DragOutcome::Cancelled`] and the image slides back.
+//! it's dragged; [`DragOutcome`] says how the drop ended. Rune windows take no drops from their
+//! own app's drags unless [`DragItem::within_app`] says so, so a drag let go over the app ends
+//! [`DragOutcome::Cancelled`] and the image slides back.
 //!
-//! macOS runs the session with `NSDraggingSource`. Other platforms don't start one yet: there
-//! `drag_out` is ignored and the element keeps its ordinary press and `on_drag` behaviour.
-//! Windows (`DoDragDrop`), Wayland and X11 backends slot in behind the same types.
+//! macOS runs the session with `NSDraggingSource`, Windows with OLE's `DoDragDrop` and the shell's
+//! drag image (`windows`). Wayland and X11 don't start one yet: there `drag_out` is ignored and the
+//! element keeps its ordinary press and `on_drag` behaviour; their backends slot in behind the
+//! same types.
 //!
 //! Windows start the session from the mouse-dragged event AppKit is delivering. Overlay panels
 //! track the pointer by polling, so there may be no such event; the overlay then builds a
@@ -23,9 +25,11 @@ use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "windows")]
+mod windows;
 
 /// Whether this platform's windows start OS drag sessions.
-pub(crate) const SUPPORTED: bool = cfg!(target_os = "macos");
+pub(crate) const SUPPORTED: bool = cfg!(any(target_os = "macos", target_os = "windows"));
 
 /// Pointer travel (points, straight-line) from the press before a drag session starts.
 /// AppKit views commonly use 4; GTK's default is 8; Windows' `SM_CXDRAG` is 4 pixels.
@@ -54,11 +58,12 @@ pub struct DragItem {
     image: Option<DragImage>,
     operations: u8,
     backing: Option<Color>,
+    within_app: bool,
 }
 
 impl Default for DragItem {
     fn default() -> Self {
-        Self { files: Vec::new(), png: None, text: None, image: None, operations: DragOperation::Copy.bit(), backing: None }
+        Self { files: Vec::new(), png: None, text: None, image: None, operations: DragOperation::Copy.bit(), backing: None, within_app: false }
     }
 }
 
@@ -134,11 +139,29 @@ impl DragItem {
     /// By default a drag only offers a copy, whatever modifier keys are held.
     pub fn allow_move(self) -> Self { self.allow(DragOperation::Move) }
 
+    /// Offer the drag to this app's own windows too, so their `on_drop_files` targets receive
+    /// its files as a drop from Finder would (an image dragged from a timeline into the
+    /// composer). By default the app's windows take no drops from its own drags. A drag let go
+    /// over a window with no target that accepts it ends [`DragOutcome::Copied`] without sliding
+    /// back, as the window takes any file drag.
+    ///
+    /// ```
+    /// # use rune::DragItem;
+    /// assert!(DragItem::new().file("/a.png").within_app().drops_within_app());
+    /// assert!(!DragItem::new().drops_within_app());
+    /// ```
+    pub fn within_app(mut self) -> Self {
+        self.within_app = true;
+        self
+    }
+
     pub fn paths(&self) -> &[PathBuf] { &self.files }
     pub fn png_data(&self) -> Option<&[u8]> { self.png.as_deref() }
     pub fn plain_text(&self) -> Option<&str> { self.text.as_deref() }
     pub fn drag_image(&self) -> Option<&DragImage> { self.image.as_ref() }
     pub fn allows_move(&self) -> bool { self.offers(DragOperation::Move) }
+    /// Whether the app's own windows take this drag's drop ([`DragItem::within_app`]).
+    pub fn drops_within_app(&self) -> bool { self.within_app }
     /// Whether the drag offers `operation` to the target.
     pub fn offers(&self, operation: DragOperation) -> bool { self.operations & operation.bit() != 0 }
     /// The colour the drag image is shown over, from [`DragItem::opaque`].
@@ -217,7 +240,7 @@ impl DragImage {
     /// Where the drag image starts, x, y, w, h in window points: `bounds` is the element's
     /// unclipped rect, and `natural` the image's size in points when [`DragImage::size`]
     /// wasn't set.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     pub(crate) fn frame(&self, bounds: [f32; 4], press: (f32, f32), natural: (f32, f32)) -> [f32; 4] {
         let (w, h) = self.size.unwrap_or(natural);
         match self.placement {
@@ -232,9 +255,9 @@ impl DragImage {
 
     /// The image composited over an opaque `backing`, blended in linear light as the window
     /// blends. `None` if the PNG doesn't decode.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     pub(crate) fn over(&self, backing: Color) -> Option<Self> {
-        let mut rgba = image::load_from_memory_with_format(&self.png, image::ImageFormat::Png).ok()?.to_rgba8();
+        let mut rgba = crate::image::png_rgba8(&self.png).ok()?;
         let bg = [backing.r, backing.g, backing.b];
         for p in rgba.pixels_mut() {
             let a = p[3] as f32 / 255.0;
@@ -273,10 +296,10 @@ pub(crate) struct DragOutStart {
     /// The element's visible drawn rect in window points: x, y, w, h.
     pub rect: [f32; 4],
     /// The element's whole drawn rect, before scroll clipping.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     pub bounds: [f32; 4],
     /// Where the pointer went down, in window points.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     pub press: (f32, f32),
 }
 
@@ -373,16 +396,18 @@ fn to_straight_rgba(pixels: &mut [u8], bgra: bool) {
 
 /// Starts the OS drag session for `start` from inside the pointer event that crossed the
 /// threshold. `done` runs once with how it ended (also when it couldn't start: `Cancelled`).
-#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(unused_variables))]
 pub(crate) fn begin(window: &winit::window::Window, start: DragOutStart, snapshot: Option<DragImage>, done: Box<dyn FnOnce(DragOutcome)>) {
     #[cfg(target_os = "macos")]
     { let picture = picture(&start.item, snapshot); macos::begin(window, start, picture, done); }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    { let picture = picture(&start.item, snapshot); windows::begin(window, start, picture, done); }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     done(DragOutcome::Cancelled);
 }
 
 /// The item's own image, else the snapshot, over the item's backing colour if it has one.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 fn picture(item: &DragItem, snapshot: Option<DragImage>) -> Option<DragImage> {
     let picture = item.drag_image().cloned().or(snapshot)?;
     match item.backing() {
@@ -392,7 +417,7 @@ fn picture(item: &DragItem, snapshot: Option<DragImage>) -> Option<DragImage> {
 }
 
 /// The path offered as text when a file drag has no text of its own.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 fn path_text(path: &Path) -> String { path.to_string_lossy().into_owned() }
 
 #[cfg(test)]

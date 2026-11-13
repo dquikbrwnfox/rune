@@ -6,10 +6,11 @@
 //! [`crate::root`]. Content is `El::anchored` to the trigger, so it follows layout, flips when
 //! it doesn't fit, and paints above everything mounted before it.
 
-use rune::{Align, Color, El, ScrollSpec, Shadow, Side, TextStyle, Transition, col, el, row, text};
-use rune_motion::{Effect, Spring, SpringPair, Vec2, tokens};
+use rune::{Align, Color, El, Shadow, Side, TextStyle, Transition, col, el, row, text};
+use rune_motion::{Spring, Vec2};
 
-use crate::{Acts, ControlSize, IconButton, IconButtonVariant, Kit, shadows};
+use crate::popover::{fit, raised};
+use crate::{Acts, ControlSize, IconButton, IconButtonVariant, Kit};
 
 /// Where an overlay sits relative to its trigger (Kobalte/Floating UI placements).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,70 +72,9 @@ fn anchor_with(motion: Spring, content: El, anchor: &str, placement: Placement, 
         .token_motion(motion)
 }
 
-/// A dropdown surface above or below its anchor is at most as tall as the window leaves it
-/// (`El::anchored_fit`); one beside it (a submenu) only flips.
-fn fit(content: El, anchor: &str, side: Side, align: Align, gap: f32) -> El {
-    if matches!(side, Side::Top | Side::Bottom) {
-        content.anchored_fit(anchor, side, align, gap)
-    } else {
-        content.anchored(anchor, side, align, gap)
-    }
-}
-
-/// How far a dropdown's scrolling edge fades while rows are hidden under it: over half a row, so
-/// a list that scrolls reads as one even where the system hides scrollbars (hex#840).
-pub(crate) const LIST_SCROLL_FADE: f32 = 16.0;
-
-/// A dropdown's rows in a scroll viewport that shrinks with its fitted surface, so a list
-/// longer than the window has room for scrolls, its edges fading ([`LIST_SCROLL_FADE`]) while
-/// rows pass under them; a row brought into view stops clear of the fade. Put it in a column
-/// with `.min_h(0.0)` up to the surface.
-pub(crate) fn fit_scroll(rows: El) -> El {
-    col()
-        .key("scroll")
-        .w_full()
-        .shrink()
-        .min_h(0.0)
-        .scroll(ScrollSpec { stick_bottom: false })
-        .scroll_edge_fade(LIST_SCROLL_FADE)
-        .scroll_margin(LIST_SCROLL_FADE)
-        .child(rows)
-}
-
-/// [`fit_scroll`] with a [`crate::scroll_bar`] over its right edge, in a column keyed
-/// `{key}-scroll-area` that shrinks in its place.
-pub(crate) fn fit_scroll_bar(k: &Kit, key: &str, rows: El) -> El {
-    crate::scroll_bar(k, &format!("{key}-scroll-area"), "scroll", fit_scroll(rows)).w_full().shrink().min_h(0.0)
-}
-
-/// Positions a menu surface next to `anchor` with no entrance: it is there on the next frame,
-/// and only its close fades (`.25 / 0`).
-/// The 0.1 s enter spring only plays when a menu reopens mid-fade, from wherever the fade was.
-pub(crate) fn menu_anchor(k: &Kit, content: El, anchor: &str, placement: Placement, gap: f32) -> El {
-    let (side, align) = placement.split();
-    let fade = Transition {
-        insertion: Effect::IDENTITY,
-        removal: Effect::opacity(0.0),
-        springs: SpringPair::new(tokens::INSTANT, Spring::new(0.25, 0.0)),
-        ..Transition::identity()
-    };
-    // The surface's identity entrance alone does not suppress nested default fades.
-    // Land its contents too, so rows are opaque and hit-testable on the first frame.
-    fit(content, anchor, side, align, gap)
-        .transition(fade)
-        .instant_changes()
-        .motion_intent(rune::MotionIntent::CUT)
-        .token_motion(k.motion.overlay)
-}
-
 /// A transparent full-window press target under an open overlay: pressing outside closes it.
 pub fn scrim<S: 'static>(key: impl Into<String>, close: impl Fn(&mut S) + 'static) -> El {
     el().key(key).role("none").absolute(0.0, 0.0).w_full().h_full().on_press(close)
-}
-
-/// The older raised surface (popover, hover card): raised fill, half-strength border, md shadow.
-pub(crate) fn raised(k: &Kit, e: El, radius: f32) -> El {
-    shadows(k, e.radius(radius).fill(k.c.surface_raised).border(1.0, k.alpha(k.c.std_border, 0.5)), &k.elevation.md)
 }
 
 /// `Popover::new("share").trigger(button).title("Share").open(s.open).build(&kit, &mut layer)`.
@@ -299,6 +239,8 @@ pub struct TooltipStyle {
     ink: Color,
     shadows: Vec<Shadow>,
     motion: Spring,
+    /// A keybind's keys (`keybind-v2` neutral): their fill and label colour.
+    keys: (Color, Color),
 }
 
 impl TooltipStyle {
@@ -311,15 +253,16 @@ impl TooltipStyle {
             radius: 4.0,
             padding: (6.0, 5.0),
             max_w: None,
-            font: k.ty.small_medium,
+            font: tabular(k.ty.small_medium),
             ink: c.text_base,
             shadows: k.shadow_layers(&k.elevation.floating).collect(),
             motion: k.motion.overlay,
+            keys: (c.layer_03, c.text_muted),
         };
         match appearance {
             TooltipAppearance::Compact => base,
             TooltipAppearance::Large => {
-                TooltipStyle { padding: (12.0, 12.0), font: TextStyle { weight: 530.0, ..k.ty.ui_compact }, ..base }
+                TooltipStyle { padding: (12.0, 12.0), font: tabular(TextStyle { weight: 530.0, ..k.ty.ui_compact }), ..base }
             }
             TooltipAppearance::Standard => TooltipStyle {
                 fill: c.surface_float,
@@ -388,6 +331,41 @@ impl TooltipStyle {
     pub fn text_color(&self) -> Color {
         self.ink
     }
+    /// This look for Rune's own [`El::help`](rune::El::help) tooltips
+    /// ([`Cx::help_look`](rune::Cx::help_look)), placed and timed as `@opencode/ui`'s
+    /// `Tooltip` sets Kobalte's: 4 pt from its element, 8 pt inside the window, after 400 ms,
+    /// and at once within 300 ms of the last one hiding; it fades and scales in from 0.96 over
+    /// 120 ms ease-out and out over 80 ms ease-in (`tooltip.css`). Its keycaps are `keybind-v2`'s
+    /// neutral keys: 14 pt, 4 pt in, 2 pt corners and 2 pt apart, 6 pt after the text, their
+    /// labels in uppercase 11/530. Rows ([`El::help_row`](rune::El::help_row)) stack 6 pt apart,
+    /// as a tooltip listing two commands does (`line-comment.tsx`, `flex-col gap-1.5`).
+    pub fn help_look(&self) -> rune::HelpLook {
+        let (ring_w, ring) = self.border.unwrap_or((0.0, Color::TRANSPARENT));
+        let key = TextStyle::new(11.0, 530.0).lh(11.0).tracking(0.05).features("'tnum' 1, 'lnum' 1");
+        rune::HelpLook::system(false)
+            .fill(self.fill)
+            .ink(self.ink)
+            .ring(ring_w, ring)
+            .radius(self.radius)
+            .padding(self.padding.0, self.padding.1)
+            .font(self.font)
+            .max_width(self.max_w)
+            .shadows(self.shadows.iter().copied())
+            .gap(4.0)
+            .margin(8.0)
+            .delay(0.4)
+            .skip_delay(0.3)
+            .fade(0.12, 0.08, 0.96)
+            .keycaps(self.keys.0, self.keys.1, TextStyle { family: self.font.family, ..key }, true)
+            .keycap_shape(14.0, 4.0, 2.0, 2.0, 6.0)
+            .row_gap(6.0)
+    }
+}
+
+/// Compact and large tooltips set their figures tabular (`tooltip.css`), unless the type
+/// already sets its own features.
+fn tabular(t: TextStyle) -> TextStyle {
+    if t.features.is_empty() { t.features("'tnum' 1") } else { t }
 }
 
 /// A tooltip: `Tooltip::new("save-tip").trigger(btn).text(&kit, "Save").open(hovered).build(&kit, &mut layer)`,
@@ -456,14 +434,10 @@ impl Tooltip {
 
     /// The tooltip's type for its appearance (use it for extra spans).
     pub fn font(&self, k: &Kit) -> TextStyle {
-        match self.appearance {
-            TooltipAppearance::Compact => k.ty.small_medium,
-            TooltipAppearance::Standard => k.ty.text_small_medium,
-            TooltipAppearance::Large => TextStyle { weight: 530.0, ..k.ty.ui_compact },
-        }
+        TooltipStyle::from_kit(k, self.appearance).font
     }
     pub fn ink(&self, k: &Kit) -> Color {
-        if self.appearance == TooltipAppearance::Standard { k.c.text_invert_strong } else { k.c.text_base }
+        TooltipStyle::from_kit(k, self.appearance).ink
     }
 
     pub fn build(self, k: &Kit, layer: &mut Vec<El>) -> El {

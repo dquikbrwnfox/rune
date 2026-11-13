@@ -150,6 +150,7 @@ impl Trace {
                 | if e.scrolling { F::SCROLLING } else { 0 }
                 | if clipped { F::CLIPPED } else { 0 }
                 | if blank.contains(e.path.as_str()) { F::BLANK } else { 0 }
+                | if e.loop_phase.is_some() { F::LOOPING } else { 0 }
                 | intent << 8;
             let q = [
                 (f64::from(x) * 100.0).round() as i64,
@@ -355,6 +356,12 @@ pub(crate) fn tree_json<S>(rt: &Runtime<S>, real_t: f64) -> Value {
             if e.drag_out {
                 v["dragOut"] = true.into();
             }
+            if let Some(c) = e.caret {
+                v["caret"] = c.map(r2).to_vec().into();
+            }
+            if let Some(r) = e.edit_range {
+                v["selection"] = r.to_vec().into();
+            }
             if let Some(video) = videos.get(&e.path) {
                 v["video"] = video_json(video);
             }
@@ -375,6 +382,12 @@ pub(crate) fn tree_json<S>(rt: &Runtime<S>, real_t: f64) -> Value {
     });
     if let Some(menu) = rt.popup_json() { tree["popupMenu"] = menu; }
     if let Some(dialog) = rt.file_dialog_json() { tree["fileDialog"] = dialog; }
+    // Where the input method's candidate window opens: the window's IME area, in view points.
+    if let Some(area) = rt.ime_area { tree["imeArea"] = area.map(r2).to_vec().into(); }
+    // The focused field's open composition, not yet part of its text.
+    if let Some((text, cursor)) = rt.focused_preedit() {
+        tree["preedit"] = json!({ "text": text, "cursor": cursor.map(|(a, b)| [a, b]) });
+    }
     if let Some(title) = rt.window_title.current() { tree["title"] = title.into(); }
     if let Some((text, rect)) = rt.help_tooltip() { tree["tooltip"] = json!({ "text": text, "rect": rect.map(r2) }); }
     tree["accessibility"] = crate::a11y::dump::json(&rt.accessibility_tree(), false);

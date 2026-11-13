@@ -4,25 +4,45 @@
 use super::*;
 
 /// Finds new nodes in the last build. Both trees are mostly in the same order, so it walks
-/// them together and builds a map only on the first node out of step.
-#[derive(Default)]
-pub(super) struct LastBuild {
-    next: usize,
-    map: Option<HashMap<NodeId, usize>>,
+/// them together, and once a node is out of step it walks together no more: it finds every
+/// later one in a map built on that first miss.
+#[derive(Debug)]
+pub(super) enum Finder {
+    /// Both trees agree on every node so far: the next one to compare sits at `next`.
+    InStep { next: usize },
+    /// The first node out of step built `map` of the last build, from `next` on.
+    Mapped { next: usize, map: HashMap<NodeId, usize> },
 }
 
-impl LastBuild {
+impl Default for Finder {
+    fn default() -> Self { Finder::InStep { next: 0 } }
+}
+
+impl Finder {
     pub(super) fn find(&mut self, old: &[Node], id: NodeId) -> Option<usize> {
-        let at = match old.get(self.next) {
-            Some(n) if n.id == id => Some(self.next),
-            _ => self.map.get_or_insert_with(|| old.iter().enumerate().map(|(i, n)| (n.id, i)).collect()).get(&id).copied(),
-        }?;
-        self.next = at + 1;
+        let at = match self {
+            Finder::InStep { next } => match old.get(*next) {
+                Some(n) if n.id == id => *next,
+                _ => {
+                    let (next, map): (usize, HashMap<NodeId, usize>) = (*next, old.iter().enumerate().map(|(i, n)| (n.id, i)).collect());
+                    let at = map.get(&id).copied();
+                    *self = Finder::Mapped { next, map };
+                    at?
+                }
+            },
+            Finder::Mapped { next, map } => match old.get(*next) {
+                Some(n) if n.id == id => *next,
+                _ => map.get(&id).copied()?,
+            },
+        };
+        self.advance(at + 1);
         Some(at)
     }
 
     pub(super) fn advance(&mut self, next: usize) {
-        self.next = next;
+        match self {
+            Finder::InStep { next: at } | Finder::Mapped { next: at, .. } => *at = next,
+        }
     }
 }
 
@@ -36,6 +56,79 @@ pub(super) fn prev_node<'a>(old_nodes: &'a [Node], nodes: &'a [Node], old: Optio
 /// The colour a node's text or icon draws in.
 pub(super) fn text_color(n: &Node) -> Option<Color> {
     n.text.as_ref().map(|t| t.color).or(n.vis.icon.map(|(_, c)| c))
+}
+
+/// Text or icon colour `c` as it paints while its hover group is `group` hovered (0 to 1):
+/// mixed toward its `El::group_color`.
+pub(super) fn group_tint(n: &Node, c: Color, group: f32) -> Color {
+    match n.vis.group_color {
+        Some(g) if group > 0.0 => c.mix(g, group),
+        _ => c,
+    }
+}
+
+/// Text or icon colour `c` while a press on the nearest `El::press_color` element is held (`pressed`,
+/// 0 to 1): mixed toward that colour.
+pub(super) fn press_tint(c: Color, to: Option<Color>, pressed: f32) -> Color {
+    match to {
+        Some(p) if pressed > 0.0 => c.mix(p, pressed),
+        _ => c,
+    }
+}
+
+/// Which of a node's colours a live value owns. A commit leaves those tracks to the latch.
+#[derive(Clone, Copy, Default)]
+pub(super) struct LiveColors {
+    pub(super) fill: bool,
+    pub(super) text: bool,
+    pub(super) border: bool,
+    pub(super) shadow: bool,
+    pub(super) gradient: [bool; 2],
+}
+
+pub(super) fn live_colors(n: &Node) -> LiveColors {
+    let mut c = LiveColors::default();
+    for b in n.live.iter() { c.add(b.property); }
+    c
+}
+
+impl LiveColors {
+    pub(super) fn add(&mut self, p: crate::live::Property) {
+        use crate::live::Property;
+        match p {
+            Property::Fill => self.fill = true,
+            Property::TextColor => self.text = true,
+            Property::Border => self.border = true,
+            Property::Shadow => self.shadow = true,
+            Property::GradientTop => self.gradient[0] = true,
+            Property::GradientBottom => self.gradient[1] = true,
+            _ => {}
+        }
+    }
+
+    /// Puts back on `new` the colours `old` last latched for the bindings it kept, since the
+    /// view authored its own placeholder colour.
+    pub(super) fn carry(self, old: &Node, new: &mut Node) {
+        if self.fill { new.vis.fill = old.vis.fill; }
+        if self.border { new.vis.set_border_color(old.vis.border()); }
+        if self.text && let Some(c) = text_color(old) {
+            if let Some(spec) = &mut new.text { if spec.color != c { spec.color = c; } }
+            else if new.vis.icon.is_some_and(|(_, ic)| ic != c) && let Some((_, ic)) = &mut new.vis.cold_mut().icon { *ic = c; }
+        }
+        if self.shadow && let Some(c) = old.vis.shadows.first().map(|s| s.color)
+            && new.vis.shadows.first().is_some_and(|s| s.color != c)
+        {
+            new.vis.cold_mut().shadows[0].color = c;
+        }
+        for k in 0..2 {
+            if self.gradient[k] && let Some(c) = old.vis.gradient.as_deref().map(|g| g[k])
+                && new.vis.gradient.as_deref().is_some_and(|g| g[k] != c)
+                && let Some(g) = new.vis.cold_mut().gradient.as_deref_mut()
+            {
+                g[k] = c;
+            }
+        }
+    }
 }
 
 /// Readies `p` (hover, press, press scale), which reads `rest` without a track, to move to
@@ -85,6 +178,7 @@ impl<S: 'static> Runtime<S> {
         id: NodeId,
         vis: &Visual,
         old: Option<usize>,
+        live: LiveColors,
         spring_c: Spring,
         spring_l: Spring,
         instant: bool,
@@ -95,7 +189,12 @@ impl<S: 'static> Runtime<S> {
         }
         for (k, sh) in vis.shadows.iter().take(P_SHADOWS.len()).enumerate() {
             let was = prev_vis(&self.nodes, vis, old).and_then(|o| o.shadows.get(k).copied());
-            self.commit_paint(id, P_SHADOWS[k], was.map(|w| w.color), sh.color, spring_c, instant);
+            // An inset ring where a drop shadow was (or the other way) is another shadow, not this
+            // one changing: it lands rather than morphing between the two.
+            let instant = instant || was.is_some_and(|w| w.inset != sh.inset);
+            if !(k == 0 && live.shadow) {
+                self.commit_paint(id, P_SHADOWS[k], was.map(|w| w.color), sh.color, spring_c, instant);
+            }
             self.commit_paint(id, P_SHADOW_GEO[k], was.map(|w| shadow_geo(&w)), shadow_geo(sh), spring_l, instant);
         }
         let prev_shadows = prev_vis(&self.nodes, vis, old).map_or(0, |o| o.shadows.len()).min(P_SHADOWS.len());
@@ -105,8 +204,11 @@ impl<S: 'static> Runtime<S> {
         }
         if let Some(&g) = vis.gradient.as_deref() {
             let was = prev_vis(&self.nodes, vis, old).and_then(|o| o.gradient.as_deref().copied());
-            self.commit_paint(id, P_GRADIENT[0], was.map(|w| w[0]), g[0], spring_c, instant);
-            self.commit_paint(id, P_GRADIENT[1], was.map(|w| w[1]), g[1], spring_c, instant);
+            for k in 0..2 {
+                if !live.gradient[k] {
+                    self.commit_paint(id, P_GRADIENT[k], was.map(|w| w[k]), g[k], spring_c, instant);
+                }
+            }
         }
         if let Some(rg) = &vis.radial {
             for (k, &(_, c)) in rg.stops.iter().take(P_RADIAL.len()).enumerate() {
@@ -158,7 +260,7 @@ impl<S: 'static> Runtime<S> {
             && memo_reuse::same_visual(&n.vis, &o.vis)
             && text_color(n) == text_color(o)
             && n.text.as_ref().is_none_or(|t| {
-                t.reveal < 0.0 || self.reveals.get(&n.id).is_some_and(|r| r.words.is_empty() && r.len == t.content.len())
+                t.reveal < 0.0 || self.reveals.get(&n.id).is_some_and(|r| r.caught_up(t.content.len()))
             })
             && self.scene.is_resting_at(n.id, scene_rect)
             && (self.stacks.is_empty()
@@ -170,3 +272,6 @@ impl<S: 'static> Runtime<S> {
 #[cfg(test)]
 #[path = "../paint_tracks_tests.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "../live_colors_tests.rs"]
+mod live_colors_tests;

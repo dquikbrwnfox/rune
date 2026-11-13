@@ -5,12 +5,15 @@
 use std::borrow::Cow;
 use std::rc::Rc;
 
-use rune::{Color, El, Icon, ScrollSpec, Spring, Tx, col, row};
+use rune::{Color, El, Icon, ScrollFade, ScrollSpec, Spring, Tx, col, el, row};
 
 use crate::{Kit, Spinner};
 
+mod auto_scroll;
 mod drag;
 mod tab;
+#[cfg(test)]
+mod tests;
 
 pub use drag::{TabDragMode, TabDragPhase, TabDragState, TearOutSpec};
 
@@ -41,10 +44,11 @@ pub enum TabDensity {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TabOverflow {
     /// Horizontal tabs share the strip equally, from `max_width` down to `min_width`, then the
-    /// strip scrolls sideways with `fade_width` feathers at its edges. Pinned tabs keep
-    /// `pinned_width`.
+    /// strip scrolls sideways with a `fade_width` linear fade at each edge while anything is
+    /// past it (Desktop's `titlebar-tabs-fade-*`). Pinned tabs keep `pinned_width`.
     ShrinkThenScroll { min_width: f32, max_width: f32, pinned_width: f32, fade_width: f32 },
-    /// Full-width rows that scroll with `fade_width` feathers at the top and bottom.
+    /// Full-width rows that scroll, the top and bottom feathering by as much as is left to scroll
+    /// past them, up to `fade_width` (Desktop's `--vertical-tabs-fade-*`).
     Scroll { fade_width: f32 },
 }
 
@@ -111,10 +115,28 @@ pub struct TabTearOut {
     pub index: usize,
     /// Pointer travel since the press, in points.
     pub offset: [f32; 2],
-    /// Where it was released, in window points, once the tab's layout has been reported (the
-    /// frame after it tore out).
+    /// Where it was released, in window points.
     pub window_point: Option<[f32; 2]>,
-    /// The same point on the desktop, for placing the new window under the pointer.
+    /// The same point on the desktop in physical pixels (`Drag::screen_point`), for placing the
+    /// new window under the pointer. `None` headless.
+    pub screen_point: Option<(i32, i32)>,
+}
+
+/// The pointer moving a torn-out tab, or bringing it back to the strip (`torn` false), while
+/// the button is still down: the app can open the tab's window now and move it with the
+/// pointer, so the drag carries on in the new window ([`TabDragState::hand_off`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TabTearMove {
+    pub id: String,
+    pub index: usize,
+    /// Off the strip; false once the tab came back within the reattach distance.
+    pub torn: bool,
+    /// Where the press landed in the tab, in points from its top-left: where the pointer sits
+    /// in the tab the new window shows.
+    pub grab: [f32; 2],
+    /// The pointer in window points.
+    pub window_point: [f32; 2],
+    /// The pointer on the desktop in physical pixels. `None` headless.
     pub screen_point: Option<(i32, i32)>,
 }
 
@@ -222,6 +244,7 @@ struct Handlers<S> {
     hover: Option<Hover<S>>,
     reorder: Option<Commit<S, TabReorder>>,
     tear_out: Option<Commit<S, TabTearOut>>,
+    tear_move: Option<Commit<S, TabTearMove>>,
 }
 
 /// What every tab of one strip shares while it builds.
@@ -236,18 +259,21 @@ struct Strip<S> {
     two_line_height: f32,
     link_inset: f32,
     count: usize,
-    zoom: f32,
     spring: Spring,
     select_on_drag_start: bool,
     /// A pointer close locks the remaining tabs' width (horizontal strips).
     horizontal_lock: bool,
     matched: Option<String>,
     close_icon: Option<&'static Icon>,
+    /// `TabStrip::close_tab_stop`.
+    close_tab_stop: bool,
     busy: fn(&Kit) -> El,
     scroll_key: String,
     list_key: String,
     /// A torn-out tab floats in the caller's layer ([`TabStrip::build_layered`]).
     layered: bool,
+    /// Where the scroll viewport is, for scrolling it while a tab is dragged near an end.
+    auto: Rc<auto_scroll::View>,
 }
 
 /// OpenCode's activity ring: the kit's spinner at 14 points in the muted icon colour, the
@@ -276,7 +302,6 @@ pub struct TabStrip<'a, S: 'static> {
     items: Vec<TabItem<'a, S>>,
     active: Option<&'a str>,
     viewport: Option<f32>,
-    zoom: f32,
     overflow: Option<TabOverflow>,
     gap: Option<f32>,
     row_height: f32,
@@ -289,6 +314,7 @@ pub struct TabStrip<'a, S: 'static> {
     drag: Option<(TabDragState, Access<S>)>,
     fill: Option<Color>,
     close_icon: Option<&'static Icon>,
+    close_tab_stop: bool,
     busy: fn(&Kit) -> El,
     label: String,
     handlers: Handlers<S>,
@@ -302,7 +328,6 @@ impl<'a, S: 'static> TabStrip<'a, S> {
             items: Vec::new(),
             active: None,
             viewport: None,
-            zoom: 1.0,
             overflow: None,
             gap: None,
             row_height: 28.0,
@@ -315,9 +340,10 @@ impl<'a, S: 'static> TabStrip<'a, S> {
             drag: None,
             fill: None,
             close_icon: None,
+            close_tab_stop: false,
             busy: busy_ring,
             label: "Tabs".into(),
-            handlers: Handlers { select: None, close: None, double: None, hover: None, reorder: None, tear_out: None },
+            handlers: Handlers { select: None, close: None, double: None, hover: None, reorder: None, tear_out: None, tear_move: None },
         }
     }
     pub fn tabs(mut self, tabs: impl IntoIterator<Item = TabItem<'a, S>>) -> Self {
@@ -334,11 +360,6 @@ impl<'a, S: 'static> TabStrip<'a, S> {
     /// width and density; without it they take their widest.
     pub fn viewport_width(mut self, width: Option<f32>) -> Self {
         self.viewport = width;
-        self
-    }
-    /// The UI zoom the strip draws at (default 1), so drags convert from window points.
-    pub fn zoom(mut self, zoom: f32) -> Self {
-        self.zoom = if zoom > 0.0 { zoom } else { 1.0 };
         self
     }
     /// The overflow policy (default [`TabOverflow::HORIZONTAL_DEFAULT`] or
@@ -363,7 +384,8 @@ impl<'a, S: 'static> TabStrip<'a, S> {
         self.select_on_drag_start = Some(on);
         self
     }
-    /// Lets a drag across the strip tear a tab out ([`Self::on_tear_out`]). Off by default.
+    /// Lets a drag across the strip tear a tab out ([`Self::on_tear_out`]). Off by default, and
+    /// never for the only tab unless [`TearOutSpec::lone`].
     pub fn tear_out(mut self, spec: Option<TearOutSpec>) -> Self {
         self.tear = spec;
         self
@@ -408,6 +430,12 @@ impl<'a, S: 'static> TabStrip<'a, S> {
         self.close_icon = Some(icon);
         self
     }
+    /// Each tab's close button is a Tab stop after its tab with the kit's focus ring, as a web
+    /// page's `<button>` is. Off, it's pointer only: the strip's arrows move between tabs.
+    pub fn close_tab_stop(mut self, on: bool) -> Self {
+        self.close_tab_stop = on;
+        self
+    }
     /// What a busy tab shows (default the kit's spinner at 14 points).
     pub fn busy_indicator(mut self, f: fn(&Kit) -> El) -> Self {
         self.busy = f;
@@ -431,7 +459,9 @@ impl<'a, S: 'static> TabStrip<'a, S> {
         self.handlers.double = Some(Rc::new(f));
         self
     }
-    /// The pointer entering (`true`) and leaving a tab.
+    /// The pointer entering (`true`) and leaving a tab. The strip draws its hover by hover
+    /// groups, so a handler that changes nothing the view draws says `tx.live_only()`, and the
+    /// hover runs no view; without a handler it never does.
     pub fn on_hover(mut self, f: impl Fn(&mut S, &str, bool, &mut Tx) + 'static) -> Self {
         self.handlers.hover = Some(Rc::new(f));
         self
@@ -442,6 +472,11 @@ impl<'a, S: 'static> TabStrip<'a, S> {
     }
     pub fn on_tear_out(mut self, f: impl Fn(&mut S, TabTearOut, &mut Tx) + 'static) -> Self {
         self.handlers.tear_out = Some(Rc::new(f));
+        self
+    }
+    /// Each move of a torn-out tab, and its return to the strip, while the button is down.
+    pub fn on_tear_move(mut self, f: impl Fn(&mut S, TabTearMove, &mut Tx) + 'static) -> Self {
+        self.handlers.tear_move = Some(Rc::new(f));
         self
     }
 
@@ -462,16 +497,31 @@ impl<'a, S: 'static> TabStrip<'a, S> {
         let gap = self.gap.unwrap_or(if vertical { 3.0 } else { 6.0 });
         let count = self.items.len();
         let pinned = self.items.iter().filter(|t| t.pinned).count();
-        let drag = self.drag.as_ref().map(|d| d.0.clone()).unwrap_or_default();
+        let mut drag = self.drag.as_ref().map(|d| d.0.clone()).unwrap_or_default();
         let access = self.drag.as_ref().map(|d| d.1);
         let trailing = if self.trailing.is_some() { self.trailing_width + gap } else { 0.0 };
+        // A tab coming in from another strip takes its share already, so it lands in its gap as is.
+        let incoming = usize::from(drag.incoming().is_some());
         let (tab_w, pinned_w) = match overflow {
             TabOverflow::ShrinkThenScroll { max_width, pinned_width, min_width, .. } => {
-                let w = self.viewport.map_or(max_width, |v| overflow.tab_width(v - trailing, count - pinned, pinned, gap));
+                let w = self.viewport.map_or(max_width, |v| overflow.tab_width(v - trailing, count - pinned + incoming, pinned, gap));
                 (drag.width_lock.map_or(w, |l| l.max(min_width)), pinned_width)
             }
             TabOverflow::Scroll { .. } => (f32::INFINITY, f32::INFINITY),
         };
+        // Each tab's length along the strip with the gap after it: its width across, its row down.
+        let two_line_height = 45.0;
+        let pitch = |pin: bool, two_line: bool| match (vertical, pin) {
+            (false, true) => pinned_w + gap,
+            (false, false) => tab_w + gap,
+            (true, _) => (if two_line { two_line_height } else { self.row_height }) + gap,
+        };
+        let pitches: Vec<f32> = self.items.iter().map(|t| pitch(t.pinned, t.subtitle.is_some())).collect();
+        let auto = auto_scroll::view(&format!("{}-scroll", self.key));
+        if let Some(point) = drag.incoming() {
+            let slot = landing_slot(&pitches, pinned, point, &auto, vertical);
+            drag.open_gap(slot, pitch(false, false));
+        }
         let st = Strip {
             handlers: self.handlers,
             access,
@@ -479,27 +529,28 @@ impl<'a, S: 'static> TabStrip<'a, S> {
             separator: if k.dark { k.c.layer_02 } else { k.c.layer_03 },
             gap,
             row_height: self.row_height,
-            two_line_height: 45.0,
+            two_line_height,
             link_inset: 8.0,
             count,
-            zoom: self.zoom,
             spring: self.spring,
             select_on_drag_start: self.select_on_drag_start.unwrap_or(!vertical),
             horizontal_lock: !vertical,
             matched: self.matched.map(str::to_owned),
             close_icon: self.close_icon,
+            close_tab_stop: self.close_tab_stop,
             busy: self.busy,
+            auto,
             scroll_key: format!("{}-scroll", self.key),
             list_key: format!("{}-list", self.key),
             layered: layer.is_some(),
             drag,
         };
         let active = self.active;
-        let hovered = st.drag.hovered().map(str::to_owned);
         let ids: Vec<String> = self.items.iter().map(|t| t.id.clone().into_owned()).collect();
-        let quiet = |i: usize| active == Some(ids[i].as_str()) || hovered.as_deref() == Some(ids[i].as_str());
-        let tear = self.tear.filter(|_| count > 1);
-        let tabs: Vec<El> = self
+        // A hover hides its tab's separators by hover groups (`tab::build`); the active tab has none.
+        let quiet = |i: usize| active == Some(ids[i].as_str());
+        let tear = self.tear.filter(|t| count > 1 || t.lone);
+        let mut tabs: Vec<El> = self
             .items
             .into_iter()
             .enumerate()
@@ -507,26 +558,28 @@ impl<'a, S: 'static> TabStrip<'a, S> {
                 let pin = item.pinned;
                 let width = (!vertical).then_some(if pin { pinned_w } else { tab_w });
                 let (lo, hi) = if pin { (0, pinned) } else { (pinned, count) };
-                let row = match width {
-                    Some(w) => w + gap,
-                    None if item.subtitle.is_some() => st.two_line_height + gap,
-                    None => st.row_height + gap,
-                };
                 let at = tab::Place {
                     index: i,
-                    lane: drag::Lane { index: i, lo, hi, pitch: row, pinned: pin, tear },
+                    lane: drag::Lane { index: i, lo, hi, pitch: pitches[i], pinned: pin, tear },
                     width,
                     density: if pin { TabDensity::IconOnly } else { width.map_or(TabDensity::Full, TabOverflow::density_for) },
                     active: active == Some(ids[i].as_str()),
                     separator: !vertical && i > 0 && !quiet(i) && !quiet(i - 1),
                 };
-                let (tab, ghost) = tab::build(item, at, &st, k);
+                let (tab, ghost) = tab::build(item, at, (i > 0).then(|| ids[i - 1].as_str()), &st, k);
                 if let (Some(layer), Some(ghost)) = (layer.as_deref_mut(), ghost) {
                     layer.push(ghost);
                 }
                 tab
             })
             .collect();
+        // The incoming tab's place: an empty slot its own length, which the tabs after it make
+        // room for on the reorder spring and the tab takes when it's let go.
+        if let Some((slot, pitch)) = st.drag.gap() {
+            let place = el().key(format!("{}-incoming", st.list_key)).a11y_hidden();
+            let place = if vertical { place.w_full().h(pitch) } else { place.w(pitch - gap).h(st.row_height) };
+            tabs.insert(slot.min(tabs.len()), place);
+        }
         let fade = overflow.fade();
         let mut root = if vertical {
             let list = col().key(st.list_key.clone()).role("tablist").label(self.label).focus_group().w_full().pb(fade).children(tabs);
@@ -536,23 +589,42 @@ impl<'a, S: 'static> TabStrip<'a, S> {
                 .grow(1.0)
                 .min_h(0.0)
                 .scroll(ScrollSpec { stick_bottom: false })
-                .scroll_edge_fade(fade)
+                .scroll_fade(ScrollFade::feather(fade))
                 .scroll_margin(fade)
                 .child(list);
+            let scroll = auto_scroll::watch(scroll, &st.auto);
             col().key(self.key).w_full().grow(1.0).min_h(0.0).child(scroll).children(self.trailing)
         } else {
             let list = row().key(st.list_key.clone()).role("tablist").label(self.label).focus_group().gap(gap).center_y().children(tabs);
-            let scroll = row().key(st.scroll_key.clone()).h(st.row_height).shrink().min_w(0.0).scroll_x().scroll_edge_fade(fade).child(list);
+            let scroll = row().key(st.scroll_key.clone()).h(st.row_height).shrink().min_w(0.0).scroll_x().scroll_fade(ScrollFade::strength(fade).linear().full_at(0.1)).child(list);
+            let scroll = auto_scroll::watch(scroll, &st.auto);
             // It grows into the space it's given, so its width is what the tabs may share.
             row().key(self.key).grow(1.0).shrink().min_w(0.0).gap(gap).center_y().child(scroll).children(self.trailing)
         };
         if let Some(access) = access {
-            root = root.on_hover_change(move |s: &mut S, inside, _: &mut Tx| {
-                if !inside {
-                    access(s).leave();
+            root = root.on_hover_change(move |s: &mut S, inside, tx: &mut Tx| {
+                // Only letting go of the width lock a close left changes what the strip draws.
+                if inside || !access(s).leave() {
+                    tx.live_only();
                 }
             });
         }
         root
     }
+}
+
+/// The slot a tab dragged in from another strip lands in at `point` (view points): after each
+/// unpinned tab whose middle the point has passed, measured with each tab's own length (`pitches`)
+/// from where the strip's viewport drew and how far it has scrolled.
+fn landing_slot(pitches: &[f32], pinned: usize, point: [f32; 2], auto: &auto_scroll::View, vertical: bool) -> usize {
+    let a = usize::from(vertical);
+    let along = point[a] - auto_scroll::rect(auto)[a] + auto_scroll::offset(auto, vertical);
+    let mut start = 0.0;
+    for (i, pitch) in pitches.iter().enumerate() {
+        if i >= pinned && along < start + pitch / 2.0 {
+            return i;
+        }
+        start += pitch;
+    }
+    pitches.len()
 }

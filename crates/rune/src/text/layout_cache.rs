@@ -9,6 +9,19 @@ use super::{Ink, Layout, TextStyle, TextSystem, shape_key};
 /// Shaped text by hash.
 pub(super) type Cache<T> = HashMap<u64, Entry<T>>;
 
+/// Where a layout [`TextSystem::layout_keyed`] makes is kept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Keep {
+    /// In the shared cache, by its text's key, for every text that shows it.
+    Cached,
+    /// Only by the caller: a by-paragraph field's paragraph, which its
+    /// [`ParagraphLayout`](super::ParagraphLayout) keeps across edits.
+    Owned,
+    /// Only by the caller, shaped in a context of its own that keeps none of its characters:
+    /// secure text.
+    Secret,
+}
+
 #[derive(Clone)]
 pub(crate) struct CachedElision {
     pub(crate) layout: Rc<Layout<Ink>>,
@@ -48,9 +61,14 @@ pub(super) const STALE_BYTES: usize = 3 << 20;
 /// least recently used first. A view's layouts all share the commit it was last shown in, so
 /// that commit's are kept while the budget lasts rather than all dropped together.
 fn evict<T>(cache: &mut Cache<T>, g: u32) {
+    evict_to(cache, g, STALE_BYTES);
+}
+
+/// [`evict`] to `budget` bytes of stale layouts.
+fn evict_to<T>(cache: &mut Cache<T>, g: u32, budget: usize) {
     let stale = |used: u32| g.wrapping_sub(used) >= 2;
     let total: usize = cache.values().filter(|e| stale(e.used)).map(|e| e.cost as usize).sum();
-    if total <= STALE_BYTES {
+    if total <= budget {
         return;
     }
     let mut ages: Vec<(u32, usize)> = cache.values().filter(|e| stale(e.used)).map(|e| (g.wrapping_sub(e.used), e.cost as usize)).collect();
@@ -59,12 +77,12 @@ fn evict<T>(cache: &mut Cache<T>, g: u32) {
     for (i, &(age, cost)) in ages.iter().enumerate() {
         if i > 0 && ages[i - 1].0 != age { younger = kept; }
         kept += cost;
-        if kept > STALE_BYTES {
+        if kept > budget {
             cutoff = age;
             break;
         }
     }
-    let mut room = STALE_BYTES - younger;
+    let mut room = budget - younger;
     cache.retain(|_, e| {
         let (age, cost) = (g.wrapping_sub(e.used), e.cost as usize);
         age < cutoff || age == cutoff && cost <= room && { room -= cost; true }
@@ -87,14 +105,32 @@ impl TextSystem {
             let gone = &self.superseded;
             self.layouts.retain(|_, e| e.used == g || !gone.contains(&e.shape));
             self.elisions.retain(|_, e| e.used == g || !gone.contains(&e.shape));
+            self.paragraphs.retain(|_, e| e.used == g || !gone.contains(&e.shape));
             self.superseded.clear();
         }
         evict(&mut self.layouts, g);
+        evict(&mut self.paragraphs, g);
+        self.last_paragraphs = None;
         let layouts = &self.layouts;
         self.shapes.retain(|_, key| layouts.contains_key(key));
         evict(&mut self.elisions, g);
         evict(&mut self.runs, g);
         self.generation = g.wrapping_add(1);
+    }
+
+    /// A window at rest (`window::rest`): drops every layout the last two commits didn't use,
+    /// and the glyph runs drawn from them. A view shown again after it shapes afresh, as one
+    /// shown for the first time does.
+    pub(crate) fn rest(&mut self) {
+        // `end_commit` moved the generation on after the last commit.
+        let g = self.generation.wrapping_sub(1);
+        evict_to(&mut self.layouts, g, 0);
+        evict_to(&mut self.paragraphs, g, 0);
+        evict_to(&mut self.elisions, g, 0);
+        evict_to(&mut self.runs, g, 0);
+        let layouts = &self.layouts;
+        self.shapes.retain(|_, key| layouts.contains_key(key));
+        self.glyph_cache.drop_orphans();
     }
 
     #[inline]

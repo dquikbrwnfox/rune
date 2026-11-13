@@ -8,7 +8,7 @@ impl TextEdit {
     /// Map a model byte range `start..end` (in `self.text`) onto `self.display().0` byte ranges,
     /// shifting or splitting around any active IME `preedit` splice.
     pub(crate) fn map_range_to_display(&self, start: usize, end: usize) -> Vec<(u32, u32)> {
-        if (self.secure && !self.revealed) || start >= end {
+        if self.is_masked() || start >= end {
             return Vec::new();
         }
         let s = Self::clamp_char_boundary(&self.text, start);
@@ -16,7 +16,7 @@ impl TextEdit {
         if s >= e {
             return Vec::new();
         }
-        let Some((ref p, _)) = self.preedit else {
+        let Some((p, _)) = self.preedit() else {
             return vec![(s as u32, e as u32)];
         };
         let (a, b) = self.range();
@@ -123,7 +123,7 @@ impl TextEdit {
 
         // If IME preedit is active, style the preedit range with `self.active_marks()` (which
         // includes any pending typing style or inherited marks at the caret).
-        if let Some((ref p, _)) = self.preedit
+        if let Some((p, _)) = self.preedit()
             && !p.is_empty()
         {
             let (a, _) = self.range();
@@ -173,7 +173,7 @@ impl TextEdit {
         if self.secure {
             return Vec::new();
         }
-        if self.preedit.is_none() {
+        if self.preedit().is_none() {
             let t = &self.text;
             return self
                 .marks
@@ -203,7 +203,7 @@ impl TextEdit {
         if self.blocks.is_empty() {
             return vec![Block::Paragraph; line_count];
         }
-        if self.preedit.is_none() {
+        if self.preedit().is_none() {
             let mut out = self.blocks.clone();
             out.resize(line_count, Block::Paragraph);
             return out;
@@ -223,18 +223,9 @@ impl TextEdit {
     /// byte range of the preedit within it.
     pub fn display(&self) -> (String, Option<(usize, usize)>) {
         if self.secure {
-            let text = if self.revealed {
-                self.text.clone()
-            } else if self.is_single_line() {
-                "•".repeat(self.text.chars().count())
-            } else if self.text.is_empty() {
-                String::new()
-            } else {
-                MULTILINE_SECURE_MASK.to_owned()
-            };
-            return (text, None);
+            return (self.masked_display(), None);
         }
-        match &self.preedit {
+        match self.preedit() {
             Some((p, _)) => {
                 let (a, b) = self.range();
                 let mut s = String::with_capacity(self.text.len() + p.len());

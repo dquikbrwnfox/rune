@@ -46,7 +46,7 @@ impl<S: 'static> Runtime<S> {
         let (expanded, steps, scrolls) = (n.a11y.expanded, n.focus.step.is_some(), n.scroll.is_some());
         let focusable = self.can_focus(i);
         let action = match (request.action, link) {
-            (Ak::Click, Some(k)) => Action::Link(path, k),
+            (Ak::Click, Some(k)) => Action::Link(path, k, crate::PointerButton::Primary),
             (Ak::ShowContextMenu, Some(k)) => {
                 let Some((_, r)) = self.link_boxes(i, self.drawn_box(i)).into_iter().find(|(j, _)| *j == k) else { return false };
                 Action::LinkSecondary(path, k, self.pointer_event(i, r[0], r[3]))
@@ -178,7 +178,7 @@ impl<S: 'static> Runtime<S> {
     /// Focuses field `path` (as a reader focuses it first) and edits it through its editor, so
     /// its change and submit handlers run as for typing.
     fn a11y_edit(&mut self, path: String, tx: &mut Tx, f: impl FnOnce(&mut crate::edit::TextEdit) -> crate::edit::EditOutcome) -> bool {
-        if self.focused.as_deref() != Some(path.as_str()) { self.set_focus(Some(path.clone()), true); }
+        if self.focus.path() != Some(path.as_str()) { self.set_focus(Some(path.clone()), true); }
         log_event!(self, "a11y edit {path}");
         self.with_focused(f, tx)
     }

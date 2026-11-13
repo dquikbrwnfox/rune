@@ -1,11 +1,12 @@
 //! On-demand unbuilt virtual-row building, copy collection, ⌘A span resolution, and programmatic
 //! selection requests on unbuilt rows.
 use super::{
-    EndRef, MAX_VIRTUAL_COPY_BYTES, MAX_VIRTUAL_COPY_ROWS, OffscreenText,
-    collect_virtual_row_selection, offscreen_piece, push_capped,
+    EndRef, MAX_VIRTUAL_COPY_BYTES, MAX_VIRTUAL_COPY_ROWS, OffscreenText, PinsEvent, Source,
+    collect_virtual_row_selection, offscreen_piece,
 };
 use crate::el::{SelectRequest, SelectionCopy};
-use crate::runtime::selectable::{SelectedText, TextSelection, Unit, floor_boundary};
+use crate::runtime::selectable::phase::{self, Selection};
+use crate::runtime::selectable::{CopyJoin, SelectedText, TextSelection, floor_boundary};
 use crate::runtime::{Node, Runtime, playground_host};
 
 impl<S: 'static> Runtime<S> {
@@ -43,47 +44,41 @@ impl<S: 'static> Runtime<S> {
     ) {
         let Some(v) = self.virtuals.get(list_path) else { return };
         let Some(key) = v.keys.get(r) else { return };
-        if let Some(rows) = &v.selection.source {
-            let state = playground_host::handler_states_ref(&self.state, self.playground.as_deref());
-            let mut row = (rows.build)(state, r).key(key.clone());
-            if !crate::input::key_diagnostics::clean(&row) {
-                let _ = crate::input::key_diagnostics::repair_at(&mut row, &format!("{list_path}/{key}"));
+        let (group_path, inert) = (v.selection.scope.group_path.as_deref(), v.selection.scope.inert);
+        match v.selection.pins.source() {
+            Some(Source::Rebuild(rows)) => {
+                let state = playground_host::handler_states_ref(&self.state, self.playground.as_deref());
+                let mut row = (rows.build)(state, r).key(key.clone());
+                if !crate::input::key_diagnostics::clean(&row) {
+                    let _ = crate::input::key_diagnostics::repair_at(&mut row, &format!("{list_path}/{key}"));
+                }
+                collect_virtual_row_selection(&row, list_path, key, r, group_path, inert, texts, providers);
             }
-            collect_virtual_row_selection(
-                &row, list_path, key, r,
-                v.selection.group_path.as_deref(), v.selection.inert,
-                texts, providers,
-            );
-        } else if let Some(row) = v.selection.unmounted.get(&r) {
-            collect_virtual_row_selection(
-                row, list_path, key, r,
-                v.selection.group_path.as_deref(), v.selection.inert,
-                texts, providers,
-            );
+            Some(Source::Stored) => {
+                if let Some(row) = v.selection.stored.get(&r) {
+                    collect_virtual_row_selection(row, list_path, key, r, group_path, inert, texts, providers);
+                }
+            }
+            // Before the list's first commit there is nothing to build a row from, as dev's
+            // default `Source::Stored` with an empty map had.
+            None => {}
         }
     }
 
-    /// Pins row `r` of `list_path` in `v.pinned_rows` and ensures its offscreen texts are built in
-    /// `v.selection.texts`.
+    /// Pins row `r` of `list_path` and ensures its offscreen texts are kept.
     pub(crate) fn pin_offscreen_row(&mut self, list_path: &str, r: usize) {
         let Some(v) = self.virtuals.get(list_path) else { return };
         if v.range.contains(&r) || r >= v.keys.len() {
             return;
         }
         let row_key = v.keys[r].clone();
-        let already = v.selection.texts.iter().any(|t| t.row_key == row_key);
+        let already = v.selection.pins.has_text_row(&row_key);
         let (mut texts, mut providers) = (Vec::new(), Vec::new());
         if !already {
             self.build_unmounted_row(list_path, r, &mut texts, &mut providers);
         }
         if let Some(v) = self.virtuals.get_mut(list_path) {
-            if !v.pinned_rows.contains(&row_key) {
-                v.pinned_rows.push(row_key);
-            }
-            if !already {
-                v.selection.texts.extend(texts);
-                v.selection.copy_providers.extend(providers);
-            }
+            v.selection.pins.sync(PinsEvent::Pin { key: row_key, texts, providers });
         }
     }
 
@@ -92,7 +87,7 @@ impl<S: 'static> Runtime<S> {
     pub(crate) fn collect_virtual_selection(&self, base: Option<usize>) -> Option<TextSelection> {
         let h = self.selection_holder_end()?;
         let f = self.focus_holder_end(h)?;
-        let sel = &self.text_sel;
+        let sel = self.selectable.phase.selection()?;
         let base_path = base.map(|b| self.nodes[b].path.as_str());
 
         if h == f {
@@ -127,10 +122,11 @@ impl<S: 'static> Runtime<S> {
             && vi0 == vi1
         {
             let (_, v) = self.virtuals.iter().nth(vi0)?;
-            let row_key = &v.selection.texts[ti0].row_key;
+            let kept = v.selection.pins.texts();
+            let row_key = &kept[ti0].row_key;
             if self.offscreen_text(vi1, ti1).row_key == *row_key {
-                let (mut texts, mut out, mut first_in_row) = (Vec::new(), String::new(), true);
-                for (ti, t) in v.selection.texts.iter().enumerate() {
+                let (mut texts, mut out) = (Vec::new(), CopyJoin::default());
+                for (ti, t) in kept.iter().enumerate() {
                     if &t.row_key != row_key || t.group_path.as_deref() != Some(g_path) { continue; }
                     let end_ref = EndRef::Offscreen(vi0, ti);
                     let ord = self.tree_order(end_ref);
@@ -140,21 +136,12 @@ impl<S: 'static> Runtime<S> {
                     let b = if end_ref == last_end { last_byte.min(len) } else { len };
                     if a >= b { continue; }
                     let piece = offscreen_piece(t, a..b, base_path);
-                    let sep = if first_in_row {
-                        None
-                    } else if t.tab_before {
-                        Some('\t')
-                    } else if !out.ends_with('\n') {
-                        Some('\n')
-                    } else {
-                        None
-                    };
-                    let hit_cap = push_capped(&mut out, piece.text(), sep, MAX_VIRTUAL_COPY_BYTES);
+                    let hit_cap = out.push(&t.spec, a..b, piece.text(), t.tab_before, MAX_VIRTUAL_COPY_BYTES);
                     texts.push(piece);
-                    first_in_row = false;
                     if hit_cap { break; }
                 }
-                return (!out.is_empty()).then_some(TextSelection { texts, text: out, backward: self.selection_backward() });
+                let text = out.finish();
+                return (!text.is_empty()).then_some(TextSelection { texts, text, backward: self.selection_backward() });
             }
         }
 
@@ -173,10 +160,10 @@ impl<S: 'static> Runtime<S> {
         let v = self.virtuals.get(&list_path)?;
         let g = self.live(g_path)?;
 
-        let (mut texts, mut out) = (Vec::new(), String::new());
+        let (mut texts, mut out) = (Vec::new(), CopyJoin::default());
         let (mut unbuilt_rows, mut prev_mounted, mut hit_cap) = (0usize, None, false);
 
-        let append_mounted = |j: usize, out: &mut String, texts: &mut Vec<SelectedText>, prev_mounted: &mut Option<usize>| -> bool {
+        let append_mounted = |j: usize, out: &mut CopyJoin, texts: &mut Vec<SelectedText>, prev_mounted: &mut Option<usize>| -> bool {
             let end_ref = EndRef::Mounted(j);
             let ord = self.tree_order(end_ref);
             if ord < first_ord || ord > last_ord { return false; }
@@ -185,23 +172,9 @@ impl<S: 'static> Runtime<S> {
             let b = if end_ref == last_end { last_byte.min(len) } else { len };
             if a >= b { return false; }
             let piece = self.selected_piece(j, a..b, base);
-            let sep = if texts.is_empty() {
-                None
-            } else if let Some(p) = *prev_mounted {
-                let (pb, nb) = (self.drawn_box(p), self.drawn_box(j));
-                if nb[1] < pb[3] - 0.5 && nb[0] >= pb[2] - 0.5 {
-                    Some('\t')
-                } else if !out.ends_with('\n') {
-                    Some('\n')
-                } else {
-                    None
-                }
-            } else if !out.ends_with('\n') {
-                Some('\n')
-            } else {
-                None
-            };
-            let capped = push_capped(out, piece.text(), sep, MAX_VIRTUAL_COPY_BYTES);
+            let Some(spec) = self.nodes[j].text.as_ref() else { return false };
+            let beside = prev_mounted.is_some_and(|p| self.beside(p, j));
+            let capped = out.push(spec, a..b, piece.text(), beside, MAX_VIRTUAL_COPY_BYTES);
             texts.push(piece);
             *prev_mounted = Some(j);
             capped
@@ -248,10 +221,10 @@ impl<S: 'static> Runtime<S> {
                     prev_mounted = None;
                     let row_key = &v.keys[r];
                     let mut built_texts = Vec::new();
-                    let row_texts: Vec<&OffscreenText> = if v.selection.texts.iter().any(|t| &t.row_key == row_key) {
-                        v.selection.texts.iter().filter(|t| &t.row_key == row_key).collect()
+                    let row_texts: Vec<&OffscreenText> = if v.selection.pins.has_text_row(row_key) {
+                        v.selection.pins.texts().iter().filter(|t| &t.row_key == row_key).collect()
                     } else {
-                        if unbuilt_rows >= MAX_VIRTUAL_COPY_ROWS || out.len() >= MAX_VIRTUAL_COPY_BYTES {
+                        if unbuilt_rows >= MAX_VIRTUAL_COPY_ROWS || out.text().len() >= MAX_VIRTUAL_COPY_BYTES {
                             hit_cap = true;
                             break;
                         }
@@ -270,16 +243,7 @@ impl<S: 'static> Runtime<S> {
                         let b = if ord == last_ord { last_byte.min(len) } else { len };
                         if a >= b { continue; }
                         let piece = offscreen_piece(t, a..b, base_path);
-                        let sep = if texts.is_empty() {
-                            None
-                        } else if !first_in_row && t.tab_before {
-                            Some('\t')
-                        } else if !out.ends_with('\n') {
-                            Some('\n')
-                        } else {
-                            None
-                        };
-                        let capped = push_capped(&mut out, piece.text(), sep, MAX_VIRTUAL_COPY_BYTES);
+                        let capped = out.push(&t.spec, a..b, piece.text(), !first_in_row && t.tab_before, MAX_VIRTUAL_COPY_BYTES);
                         texts.push(piece);
                         first_in_row = false;
                         if capped {
@@ -301,7 +265,8 @@ impl<S: 'static> Runtime<S> {
             }
         }
 
-        (!out.is_empty()).then_some(TextSelection { texts, text: out, backward: self.selection_backward() })
+        let text = out.finish();
+        (!text.is_empty()).then_some(TextSelection { texts, text, backward: self.selection_backward() })
     }
 
     /// Finds the first and last selectable texts inside mounted node `root` (including unbuilt rows
@@ -450,11 +415,7 @@ impl<S: 'static> Runtime<S> {
                 let content = self.content_of(i).to_owned();
                 let (a, b) = (floor_boundary(&content, range.start), floor_boundary(&content, range.end.max(range.start)));
                 let path = self.nodes[i].path.clone();
-                let sel = &mut self.text_sel;
-                (sel.path, sel.content, sel.anchor, sel.focus, sel.origin, sel.unit, sel.far) =
-                    (Some(path), content, a, b, (a, b), Unit::Char, None);
-                (sel.anchor_end, sel.focus_end, sel.dragging) = (None, None, false);
-                self.seal_between();
+                self.select_step(phase::Event::Select(Selection::new(path, content, (a, b), (a, b))));
             }
             SelectRequest::All(key) => {
                 let Some(i) = named(&key) else {
@@ -536,14 +497,9 @@ impl<S: 'static> Runtime<S> {
                             );
                             self.pin_offscreen_row(&list_path, r);
                             let Some(end_ref) = self.resolve_end(&target_path, None) else { return false };
-                            let v_end = self.virtual_end_of(end_ref, a);
-                            let sel = &mut self.text_sel;
-                            (sel.path, sel.content, sel.anchor, sel.focus, sel.origin, sel.unit, sel.far) =
-                                (Some(target_path), content, a, b, (a, b), Unit::Char, None);
-                            sel.anchor_end = v_end;
-                            sel.focus_end = None;
-                            sel.dragging = false;
-                            self.seal_between();
+                            let mut sel = Selection::new(target_path, content, (a, b), (a, b));
+                            sel.anchor_end = self.virtual_end_of(end_ref, a);
+                            self.select_step(phase::Event::Select(sel));
                             return true;
                         }
                     }

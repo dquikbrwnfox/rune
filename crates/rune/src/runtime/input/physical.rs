@@ -17,9 +17,14 @@ impl std::fmt::Debug for Unhandled {
     }
 }
 
-/// An activation key held down: its physical code (native and physical input) or logical key
-/// (`Runtime::key`), and the focus its first press landed on.
-pub(super) struct HeldKey { physical: Option<PhysicalKeyCode>, key: Option<crate::Key>, focus: Option<String> }
+/// Whether an activation key (Enter, Escape, Space) is held down: its physical code (native and
+/// physical input) or logical key (`Runtime::key`), and the focus its first press landed on.
+#[derive(Default)]
+pub(super) enum Activation {
+    #[default]
+    Up,
+    Held { physical: Option<PhysicalKeyCode>, key: Option<crate::Key>, focus: Option<String> },
+}
 
 impl<S: 'static> Runtime<S> {
     /// Queue physical input without a logical fallback (also useful for headless drivers).
@@ -27,6 +32,7 @@ impl<S: 'static> Runtime<S> {
     pub fn physical_input(&mut self, event: PhysicalInput) {
         self.observe_mods(&event);
         if self.cancel_drag_key(&event) { return; }
+        if matches!(event, PhysicalInput::Key { pressed: true, .. }) && self.autoscroll_key() { return; }
         self.queue.push(Action::Physical(event, None));
     }
 
@@ -38,8 +44,8 @@ impl<S: 'static> Runtime<S> {
     /// queue the press itself skips. A key press hides a tooltip.
     fn observe_mods(&mut self, event: &PhysicalInput) {
         match event {
-            PhysicalInput::Modifiers(m) => { self.text_sel.shift = m.shift; self.held_mods = *m; }
-            PhysicalInput::FocusLost => { self.text_sel.shift = false; self.held_mods = Default::default(); self.dismiss_help(); }
+            PhysicalInput::Modifiers(m) => { self.selectable.shift = m.shift; self.held_mods = *m; }
+            PhysicalInput::FocusLost => { self.selectable.shift = false; self.held_mods = Default::default(); self.dismiss_help(); }
             PhysicalInput::Key { pressed: true, mods, .. } => { self.held_mods = *mods; self.dismiss_help(); }
             PhysicalInput::Key { mods, .. } => self.held_mods = *mods,
         }
@@ -59,6 +65,8 @@ impl<S: 'static> Runtime<S> {
     /// `unhandled` happens when no handler takes the logical key.
     pub(crate) fn physical_then(&mut self, event: PhysicalInput, key: Option<KeyEvent>, base: Option<char>, unhandled: Option<Unhandled>) -> bool {
         if self.cancel_drag_key(&event) { return true; }
+        // A key ends a middle-click autoscroll, and does nothing else.
+        if matches!(event, PhysicalInput::Key { pressed: true, .. }) && self.autoscroll_key() { return true; }
         if key.is_none() && matches!(event, PhysicalInput::Modifiers(_) | PhysicalInput::Key { pressed: false, .. }) {
             return self.physical_observation(event);
         }
@@ -86,7 +94,7 @@ impl<S: 'static> Runtime<S> {
         merge(&mut self.pending, tx);
         if consumed && live_only {
             self.live_only_skips += 1;
-            self.live_dirty = true;
+            self.live.set();
         } else {
             self.dirty |= consumed;
         }
@@ -103,15 +111,15 @@ impl<S: 'static> Runtime<S> {
                 | Code::CapsLock | Code::Fn)) || key.is_some_and(|k| matches!(k, Key::Modifier { .. })) { return false; }
             let activation = physical.is_some_and(|c| matches!(c, Code::Enter | Code::NumpadEnter | Code::Escape | Code::Space))
                 || key.is_some_and(|k| matches!(k, Key::Enter | Key::Escape) || matches!(k, Key::Text(t) if t == " "));
-            self.held = activation.then(|| HeldKey { physical, key: key.cloned(), focus: self.focused.clone() });
+            self.held = if activation { Activation::Held { physical, key: key.cloned(), focus: self.focus.owned() } } else { Activation::Up };
             return false;
         }
-        self.held.as_ref().is_some_and(|held| {
-            let same = match physical { Some(code) => held.physical == Some(code), None => held.key.as_ref() == key };
-            same && held.focus != self.focused
-        })
+        let Activation::Held { physical: held, key: held_key, focus } = &self.held else { return false };
+        let same = match physical { Some(code) => *held == Some(code), None => held_key.as_ref() == key };
+        same && focus.as_deref() != self.focus.path()
     }
     pub(super) fn dispatch_physical(&mut self, event: PhysicalInput, fallback: Option<Fallback>, tx: &mut Tx) -> bool {
+        tx.by_keys = true;
         use crate::PhysicalKeyCode as Code;
         let is_mod = |c: Code| matches!(c, Code::ShiftLeft | Code::ShiftRight | Code::ControlLeft
             | Code::ControlRight | Code::AltLeft | Code::AltRight | Code::SuperLeft | Code::SuperRight
@@ -122,16 +130,13 @@ impl<S: 'static> Runtime<S> {
                 if !is_mod(key) { self.note_key_down(repeat); }
             }
             PhysicalInput::Key { key, pressed: false, .. } => {
-                if self.held.as_ref().is_some_and(|h| h.physical == Some(key)) { self.held = None; }
+                if matches!(&self.held, Activation::Held { physical, .. } if *physical == Some(key)) { self.held = Activation::Up; }
                 if fallback.is_none() && !is_mod(key) && self.composing() {
-                    self.ime_keys_down = self.ime_keys_down.saturating_sub(1);
+                    self.key_releases.composing_release();
                 }
             }
             PhysicalInput::FocusLost => {
-                self.key_focus = None;
-                self.keys_held = 0;
-                self.ime_keys_down = 0;
-                self.ime_eat_key_up = false;
+                self.key_releases.lost();
             }
             PhysicalInput::Modifiers(_) => {}
         }
@@ -139,9 +144,13 @@ impl<S: 'static> Runtime<S> {
         let code = match event { PhysicalInput::Key { key, .. } => Some(key), _ => None };
         // Live-only when every handler that took the event said so (`Tx::live_only`).
         let mut live = None;
+        // Ctrl+Shift's direction chord sees every key, whoever takes it.
+        let chord = self.direction_chord(&event, tx);
+        // It changes the field, so the view builds again whatever else is live-only.
+        if chord { live = Some(false); }
         let consumed = self.offer_physical(&event, tx, &mut live);
         let modifier = self.modifier_dispatch(&event, consumed, tx, &mut live);
-        let ran = consumed || modifier | match fallback {
+        let ran = consumed || chord || modifier | match fallback {
             // A release's logical key, for `on_key_up`.
             Some(Fallback { key, base, .. }) if matches!(event, PhysicalInput::Key { pressed: false, .. }) => {
                 let mut one = Tx { physical_key: code, key_base: base, ..self.transaction() };
@@ -176,12 +185,28 @@ impl<S: 'static> Runtime<S> {
             }
             None => false,
         };
+        let ran = self.dispatch_mods(tx, &mut live) || ran;
         tx.live_only = ran && live == Some(true);
         ran
     }
+    /// `App::on_modifiers`, when the held modifiers changed since it last heard them.
+    fn dispatch_mods(&mut self, tx: &mut Tx, live: &mut Option<bool>) -> bool {
+        let Some(f) = self.on_mods.filter(|_| self.held_mods != self.mods_heard) else { return false };
+        self.mods_heard = self.held_mods;
+        let mut one = self.transaction();
+        let state = match &mut self.playground {
+            Some(playground) => playground.key_state(&mut self.state),
+            None => Some(&mut self.state),
+        };
+        let Some(state) = state else { return false };
+        f(state, self.mods_heard, &mut one);
+        fold_live(live, true, &one);
+        merge(tx, one);
+        true
+    }
     /// The focused element's `on_physical_input` handler; true if it consumed `event`.
     fn offer_physical(&mut self, event: &PhysicalInput, tx: &mut Tx, live: &mut Option<bool>) -> bool {
-        let Some(handler) = self.focused.as_deref().and_then(|p| self.node(p))
+        let Some(handler) = self.focus.path().and_then(|p| self.node(p))
             .and_then(|n| n.focus.physical.clone()) else { return false };
         let mut one = Tx { key_repeat: matches!(event, PhysicalInput::Key { repeat: true, .. }), ..self.transaction() };
         let consumed = Tx::took(handler(states!(self), event, &mut one), &mut one);

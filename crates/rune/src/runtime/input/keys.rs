@@ -6,14 +6,17 @@ impl<S: 'static> Runtime<S> {
     /// input's handler, focus traversal and the focused editor, in that order.
     pub(super) fn route_key(&mut self, ev: &KeyEvent, repeat: bool, one: &mut Tx) -> bool {
         let physical_key = one.physical_key;
+        one.by_keys = true;
         one.focused = self.focused_key();
         if matches!(ev.key, crate::Key::Modifier { .. }) { return !repeat && self.route_modifier(ev, one); }
+        // Any other key while Ctrl and Shift are down makes them a shortcut, not a direction.
+        self.disarm_direction_chord();
         one.key_repeat = repeat;
-        let shown = self.keyboard_focus || self.hover_focus;
-        self.keyboard_focus |= focus::navigates(ev);
+        let shown = self.focus.keyboard() || self.focus.hovered();
+        if focus::navigates(ev) { self.focus.step(focus_machine::FocusEvent::Navigated); }
         // With no focused element, app-owned navigation (e.g. a toolbar)
         // gets first refusal before Rune starts a new Tab traversal.
-        let app_first = self.focused.is_none();
+        let app_first = self.focus.path().is_none();
         // Return and Escape that reach a field mid-composition belong to the input method: they
         // confirm or cancel it, and submit, blur and press nothing.
         if matches!(ev.key, crate::Key::Enter | crate::Key::Escape) && self.composing() { return true; }
@@ -44,7 +47,7 @@ impl<S: 'static> Runtime<S> {
             })
         {
             let layout = self.focused_layout();
-            if self.with_focused(|e| e.key(ev, layout.as_deref()), one) {
+            if self.with_focused(|e| e.key_in(ev, layout.as_ref().map(TextLayout::view)), one) {
                 return true;
             }
         }
@@ -71,7 +74,7 @@ impl<S: 'static> Runtime<S> {
                 if copies && e.is_rich() && !e.is_secure() {
                     html = Some(e.selected_html()).filter(|h| !h.is_empty());
                 }
-                e.key(ev, layout.as_deref())
+                e.key_in(ev, layout.as_ref().map(TextLayout::view))
             }, one);
             if let Some(html) = html
                 && let Some(text) = one.copy.as_ref().filter(|w| !w.is_secret()).map(|w| w.content().text().to_owned())
@@ -114,7 +117,7 @@ impl<S: 'static> Runtime<S> {
         use crate::Key::*;
         if !matches!(ev.key, PageUp | PageDown | Home | End) || ev.mods.cmd || ev.mods.alt || ev.mods.ctrl { return false; }
         // A focused field in a virtual row that scrolled out has no node: page its list.
-        let focused = self.focused.as_deref().and_then(|path| {
+        let focused = self.focus.path().and_then(|path| {
             std::iter::successors(Some(path), |p| p.rsplit_once('/').map(|(head, _)| head))
                 .find_map(|p| self.nodes.iter().position(|n| n.path == p))
         });
@@ -146,20 +149,23 @@ impl<S: 'static> Runtime<S> {
         let (id, page, stick) = (self.nodes[i].id, f64::from(self.nodes[i].local.h * 0.9), self.nodes[i].scroll.is_some_and(|s| s.stick_bottom));
         let Some(st) = self.scrolls.get_mut(&id) else { return false };
         st.offset = to(st.offset, st.max, page).clamp(0.0, st.max);
-        st.v = 0.0;
-        st.glide = None;
-        st.direct = true;
-        st.pinned = stick && st.offset >= st.max - 0.5;
+        st.moved();
+        st.land(stick);
         true
     }
 
-    pub(super) fn focused_layout(&mut self) -> Option<Rc<Layout<Ink>>> {
-        let path = self.focused.clone()?;
+    pub(super) fn focused_layout(&mut self) -> Option<TextLayout> {
+        let path = self.focus.owned()?;
         let s = self.env.scale;
         let n = self.node(&path)?;
+        // The field shows its edit's display text: the layout it drew is that text's. A secret
+        // draws its mask, so the keys move through a layout of what it holds.
+        if let Some(l) = n.text_layout.clone().filter(|_| n.text.as_ref().is_some_and(|t| !t.redacted)) {
+            return Some(l);
+        }
         let (mut spec, w) = (n.text.clone()?, n.target[2] - n.target[0] - n.inset[0] - n.inset[2]);
         spec.replace_content(n.input.as_ref()?.edit.display().0);
-        Some(self.text.layout_for_spec(&spec, s, spec.wrap.then_some(w * s), line_alignment(&spec)))
+        Some(TextLayout::Single(self.text.layout_for_spec(&spec, s, spec.wrap.then_some(w * s), line_alignment(&spec))))
     }
 
     pub(super) fn with_focused(&mut self, f: impl FnOnce(&mut crate::edit::TextEdit) -> EditOutcome, tx: &mut Tx) -> bool {
@@ -168,7 +174,7 @@ impl<S: 'static> Runtime<S> {
 
     /// [`Self::with_focused`] for an edit that needs the app state (an app's paste hook).
     pub(super) fn with_focused_state(&mut self, f: impl FnOnce(crate::states::States<'_>, &crate::el::EditFn, &mut Tx) -> EditOutcome, tx: &mut Tx) -> bool {
-        let Some(path) = self.focused.clone() else { return false };
+        let Some(path) = self.focus.owned() else { return false };
         let Some((access, submit, change, animate_layout, single_line, secure, revealed_override)) =
             self.focused_input().map(|i| (i.access.clone(), i.submit.clone(), i.change.clone(), i.animate_layout, i.single_line, i.edit.is_secure(), i.revealed_override))
         else {
@@ -187,7 +193,7 @@ impl<S: 'static> Runtime<S> {
         // Submit and Escape's blur act once per press; held keys still type, move and delete.
         if tx.key_repeat { out.submit = false; out.blur = false; }
         // Typing is the user's own hand: no animation.
-        tx.instant = !animate_layout;
+        tx.commit = tx.commit.snap(!animate_layout);
         self.caret_follow = true;
         if let Some(change) = change
             && before.as_ref().map(|s| s.as_str()) != Some(access(states!(self)).text.as_str())
@@ -199,13 +205,13 @@ impl<S: 'static> Runtime<S> {
             tx.copy(c);
         }
         if out.blur {
-            self.set_focus(None, self.keyboard_focus);
+            self.set_focus(None, self.focus.keyboard());
         }
         if out.submit
             && let Some(sub) = submit
         {
             log_event!(self, "submit {path}");
-            tx.instant = false;
+            tx.commit = tx.commit.animated();
             sub(states!(self), tx);
         } else if out.submit {
             // A field with nothing to submit passes Return to the default button, as in a sheet.
@@ -218,8 +224,8 @@ impl<S: 'static> Runtime<S> {
     pub(super) fn composing(&mut self) -> bool {
         let Some(access) = self.focused_input().map(|i| i.access.clone()) else { return self.app_ime.composing() };
         match access {
-            Some(access) => access(states!(self)).preedit.is_some(),
-            None => self.focused_input().is_some_and(|i| i.edit.preedit.is_some()),
+            Some(access) => access(states!(self)).preedit().is_some(),
+            None => self.focused_input().is_some_and(|i| i.edit.preedit().is_some()),
         }
     }
 
@@ -240,14 +246,14 @@ impl<S: 'static> Runtime<S> {
     }
 
     pub(super) fn focused_input(&self) -> Option<&InputSpec> {
-        let path = self.focused.as_deref()?;
+        let path = self.focus.path()?;
         self.node(path).and_then(|n| n.input.as_deref()).or_else(|| self.virtual_inputs.get(path).map(Box::as_ref))
     }
 
     /// What [`Tx::focused`] reports: the focused link's id, else the focused element's key,
     /// else its path's last segment (a field in a virtual row that scrolled out has no node).
     pub(super) fn focused_key(&self) -> Option<String> {
-        let path = self.focused.as_deref()?;
+        let path = self.focus.path()?;
         if let Some(id) = self.focused_index().and_then(|i| self.focused_link_id(i)) { return Some(id); }
         Some(self.focused_index().and_then(|i| self.nodes[i].key.clone())
             .unwrap_or_else(|| path.rsplit('/').next().unwrap_or(path).to_owned()))
@@ -255,7 +261,7 @@ impl<S: 'static> Runtime<S> {
 
     /// The focused element's index. Unlike [`Runtime::node`], this finds it while it exits.
     pub(super) fn focused_index(&self) -> Option<usize> {
-        let path = self.focused.as_deref()?;
+        let path = self.focus.path()?;
         self.nodes.iter().position(|n| n.path == path)
     }
 
@@ -266,6 +272,8 @@ impl<S: 'static> Runtime<S> {
     /// [`Runtime::key`]; `stage` routes it to the open playground's stage, for `Play::press`.
     pub(super) fn queue_key(&mut self, ev: KeyEvent, stage: bool) {
         self.dismiss_help();
+        // A key ends a middle-click autoscroll, and does nothing else.
+        if self.autoscroll_key() { return; }
         // Escape during a drag cancels it and goes no further.
         if ev.key == crate::Key::Escape && self.cancel_drag() { return; }
         self.queue.push(Action::Key { ev, repeat: false, stage });
@@ -281,9 +289,12 @@ impl<S: 'static> Runtime<S> {
         self.queue.push(Action::Ime(ev));
     }
 
-    /// End native composition on window deactivation without discarding text or field focus.
-    pub fn cancel_composition(&mut self) {
-        self.ime(Ime::Preedit(String::new(), None));
+    /// The window went inactive mid-composition: what the composition shows becomes text, in
+    /// event order, as a browser keeps it, and the field keeps focus. The platform's input
+    /// method is told to drop its own copy (`ime_reset`), so it doesn't come back in the next
+    /// field.
+    pub fn finish_composition(&mut self) {
+        self.queue.push(Action::FinishIme);
         self.ime_reset = true;
     }
 
@@ -303,7 +314,7 @@ impl<S: 'static> Runtime<S> {
         self.paste_target().is_some() || self.app_paste_handler().is_some()
     }
     pub(crate) fn paste_target(&self) -> Option<String> {
-        self.focused_input().filter(|i| i.access.is_some()).and(self.focused.clone())
+        self.focused_input().filter(|i| i.access.is_some()).and(self.focus.owned())
     }
     /// What the paste target hears: every form, images too, for a field with
     /// `on_input_paste` or a root `on_paste_content` handler; text, HTML and RTF for a rich
@@ -328,12 +339,22 @@ impl<S: 'static> Runtime<S> {
         self.queue.push(Action::ClipboardRead(id, content));
     }
 
+    /// The focused field's text around its selection, for the platform's input method.
+    pub(crate) fn ime_text(&self) -> Option<crate::edit::ImeText> {
+        self.focused_input().and_then(|i| i.edit.ime_text())
+    }
+
+    /// The focused field's open composition and its cursor range, for a script's tree.
+    pub(crate) fn focused_preedit(&self) -> Option<(&str, Option<(usize, usize)>)> {
+        self.focused_input().filter(|i| !i.edit.is_secure()).and_then(|i| i.edit.preedit())
+    }
+
     /// Whether the focused editor requires secure native keyboard input.
     pub fn has_secure_focus(&self) -> bool {
         self.focused_input().is_some_and(|i| i.edit.is_secure())
     }
 
     pub fn has_focus(&self) -> bool {
-        self.focused.is_some()
+        self.focus.path().is_some()
     }
 }

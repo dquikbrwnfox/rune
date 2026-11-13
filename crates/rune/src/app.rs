@@ -33,9 +33,21 @@ mod web;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use web::with_font;
 
-type Update<S> = Box<dyn FnOnce(&mut S, &mut Tx) -> bool + Send>;
+pub(crate) type Update<S> = Box<dyn FnOnce(&mut S, &mut Tx) -> bool + Send>;
 /// `App::on_window`'s hook, run after each native window creation.
 pub(crate) type OnWindow = Box<dyn FnMut(&crate::WindowHandle)>;
+
+/// `App::turn_scope`'s hooks.
+pub(crate) struct TurnScope<S> {
+    pub(crate) enter: fn(&mut S),
+    pub(crate) leave: fn(&mut S),
+}
+
+impl<S> Clone for TurnScope<S> {
+    fn clone(&self) -> Self { *self }
+}
+
+impl<S> Copy for TurnScope<S> {}
 
 /// An `AppSpec` with its lifetime: by default it opens one window and quits when it closes,
 /// like `rune::run`.
@@ -53,7 +65,12 @@ pub struct App<S: 'static> {
     pub(crate) standard_menus: bool,
     pub(crate) keep_running: bool,
     pub(crate) on_close: Option<fn(&mut S, &mut Tx)>,
+    pub(crate) on_quit: Option<fn(&mut S, &mut Tx)>,
+    pub(crate) turn_scope: Option<TurnScope<S>>,
     pub(crate) on_focus: Option<fn(&mut S, bool, &mut Tx)>,
+    pub(crate) on_mods: Option<fn(&mut S, crate::Mods, &mut Tx)>,
+    pub(crate) on_visibility: Option<fn(&mut S, bool, &mut Tx)>,
+    pub(crate) on_rest: Option<fn(&mut S, &mut Tx) -> bool>,
     pub(crate) on_ime: Option<fn(&mut S, &crate::Ime, &mut Tx) -> bool>,
     pub(crate) on_reopen: Option<fn(&mut S, bool, &mut Tx) -> bool>,
     pub(crate) on_open_url: Option<crate::open_url::incoming::OnOpenUrl<S>>,
@@ -76,13 +93,23 @@ pub struct App<S: 'static> {
     /// `App::font_url`'s fonts, which a web app fetches before its first frame.
     #[cfg(target_arch = "wasm32")]
     pub(crate) font_urls: Vec<String>,
+    /// `App::font_url_later`'s fonts, which a web app fetches after its first frame.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) late_font_urls: Vec<String>,
     pub(crate) float_on_open: bool,
+    /// `App::open_inactive`: the first open leaves focus where it is.
+    pub(crate) open_inactive: bool,
+    /// `App::maximized`, `App::full_screen`: how the window's first open shows it.
+    pub(crate) open_as: crate::windows::OpenAs,
     pub(crate) modifier_keys: bool,
     pub(crate) tab_visits_controls: bool,
     pub(crate) srgb_blend: bool,
     pub(crate) font_smoothing: crate::FontSmoothing,
     pub(crate) dev_stats: Option<fn() -> String>,
     pub(crate) playground: Option<crate::Playground<S>>,
+    /// `playground::attach`, set by `App::playground`: a window calls it through this, so an app
+    /// without a playground doesn't link it.
+    pub(crate) attach_playground: Option<crate::playground::Attach<S>>,
 }
 
 impl<S: 'static> App<S> {
@@ -101,7 +128,12 @@ impl<S: 'static> App<S> {
             standard_menus: false,
             keep_running: false,
             on_close: None,
+            on_quit: None,
+            turn_scope: None,
             on_focus: None,
+            on_mods: None,
+            on_visibility: None,
+            on_rest: None,
             on_ime: None,
             on_reopen: None,
             on_open_url: None,
@@ -122,13 +154,18 @@ impl<S: 'static> App<S> {
             web_document: false,
             #[cfg(target_arch = "wasm32")]
             font_urls: Vec::new(),
+            #[cfg(target_arch = "wasm32")]
+            late_font_urls: Vec::new(),
             float_on_open: false,
+            open_inactive: false,
+            open_as: crate::windows::OpenAs::Normal,
             modifier_keys: false,
             tab_visits_controls: false,
             srgb_blend: true,
             font_smoothing: crate::FontSmoothing::default(),
             dev_stats: None,
             playground: None,
+            attach_playground: None,
         }
     }
 
@@ -142,8 +179,8 @@ impl<S: 'static> App<S> {
     }
 
     /// How this app's windows rasterise and place glyphs (see [`crate::FontSmoothing`]):
-    /// `On` by default on macOS, `Off` elsewhere (CoreGraphics' pipeline without font
-    /// smoothing's dilation, as `-webkit-font-smoothing: antialiased` draws).
+    /// `On` by default on macOS and in a Mac's browser, `Off` elsewhere (CoreGraphics' pipeline
+    /// without font smoothing's dilation, as `-webkit-font-smoothing: antialiased` draws).
     /// `Tx::set_font_smoothing` switches it while running.
     pub fn font_smoothing(mut self, mode: crate::FontSmoothing) -> Self {
         self.font_smoothing = mode;
@@ -190,6 +227,29 @@ impl<S: 'static> App<S> {
         self
     }
 
+    /// The window's first open shows it without taking focus or activating the app, so the
+    /// window the user works in keeps its keys and a press it holds. A later `open` or `focus`
+    /// activates it. macOS and Windows; elsewhere the window manager decides.
+    pub fn open_inactive(mut self) -> Self {
+        self.open_inactive = true;
+        self
+    }
+
+    /// Open the window maximized, as a window saved maximized reopens. The size it opens at
+    /// stays what restoring it returns to.
+    pub fn maximized(mut self, maximized: bool) -> Self {
+        self.open_as = self.open_as.maximized(maximized);
+        self
+    }
+
+    /// Open the window full screen, as a window saved full screen reopens (Electron's
+    /// `setFullScreen(true)`): borderless over the display it opens on, on Windows and Linux.
+    /// Leaving full screen returns to the frame it opened at, maximized if `maximized` is on too.
+    pub fn full_screen(mut self, full_screen: bool) -> Self {
+        self.open_as = self.open_as.full_screen(full_screen);
+        self
+    }
+
     /// Send modifier keys pressed and released on their own (`Key::Modifier`, with the side)
     /// to `on_key` and the focused input's key handler, for hold-to-talk on Fn or Right Option,
     /// or a Shift tap. Off by default, since handlers written without it may act on any key.
@@ -223,6 +283,41 @@ impl<S: 'static> App<S> {
     /// Headless scripts deliver the same callback with `{"focus": false}`.
     pub fn on_focus(mut self, f: fn(&mut S, bool, &mut Tx)) -> Self {
         self.on_focus = Some(f);
+        self
+    }
+
+    /// Hears the modifier keys held down (Shift, Control, Alt or Option, the logo key) each time
+    /// they change, wherever focus is and whether or not anything takes the key, as a web page's
+    /// window-level `keydown`/`keyup` for `Alt` hear it; and none held once the window loses
+    /// focus (a `blur`). For a reveal while a modifier is held: Desktop's Home shows every
+    /// session's worktree and branch while Alt is down. Return nothing: it can't take the key
+    /// from anyone, and [`Tx::live_only`] says the view reads nothing that changed.
+    ///
+    /// ```ignore
+    /// app.on_modifiers(|s: &mut App, mods, _| s.alt_held = mods.alt)
+    /// ```
+    pub fn on_modifiers(mut self, f: fn(&mut S, crate::Mods, &mut Tx)) -> Self {
+        self.on_mods = Some(f);
+        self
+    }
+
+    /// Hears the window go off screen (minimised, hidden, or covered whole by other windows
+    /// where the system says so) and come back, with whether it shows now, as a web page's
+    /// `visibilitychange` hears `document.hidden` change: for work that should wait while no
+    /// one can see it, such as a notification's timer. Called once per change after the first
+    /// frame. Native windows only.
+    pub fn on_visibility(mut self, f: fn(&mut S, bool, &mut Tx)) -> Self {
+        self.on_visibility = Some(f);
+        self
+    }
+
+    /// Runs when a window rests: it has drawn nothing for 10 s (1 s while the system says memory
+    /// is low), or it was hidden, minimised or covered whole. By then its renderer and Rune's
+    /// own caches have given back what they keep for frames to come (`window::rest`); this is
+    /// for the app's caches of what isn't on screen. Return whether state the view reads changed
+    /// (normally false: nothing on screen should).
+    pub fn on_rest(mut self, f: fn(&mut S, &mut Tx) -> bool) -> Self {
+        self.on_rest = Some(f);
         self
     }
 
@@ -353,6 +448,30 @@ impl<S: 'static> App<S> {
         self
     }
 
+    /// Runs once in every open window when the app starts to quit, before any window closes
+    /// for it: `Tx::quit` or `AppHandle::quit` from any window, the last window closing (in the
+    /// windows still open), macOS Quit (⌘Q, the Dock, logout, restart and shutdown), and a
+    /// Windows logoff or shutdown (`WM_QUERYENDSESSION`, or `WM_ENDSESSION` when no query came
+    /// first), as Electron's `before-quit` and `session-end` do between them. Save what must
+    /// survive the quit here, synchronously: a Windows session may end the process once the
+    /// hooks returned. From then on [`crate::quitting`] holds, so an `on_close` that follows
+    /// (macOS, the end of a Windows session) can tell the app ending from its window closing
+    /// alone. A Windows shutdown another app refuses clears it, and a later quit runs this again.
+    /// What it asks of its `Tx` beyond state is moot once the loop ends. Native windows only.
+    pub fn on_quit(mut self, f: fn(&mut S, &mut Tx)) -> Self {
+        self.on_quit = Some(f);
+        self
+    }
+
+    /// Runs `enter` before each turn of the window's event handling that can reach its state
+    /// (an event, a wake, a frame, a hook), and `leave` after it, so state the app's windows
+    /// share can move into the state of the window whose turn it is and back. The windows of
+    /// one event loop take turns, never two at once. Native windows only.
+    pub fn turn_scope(mut self, enter: fn(&mut S), leave: fn(&mut S)) -> Self {
+        self.turn_scope = Some(TurnScope { enter, leave });
+        self
+    }
+
     /// macOS: runs on the main thread when the app is reopened while it runs: its Dock icon
     /// clicked, or opened again from Finder, Spotlight or `open`, also in an accessory app.
     /// `has_visible_windows` says whether any Rune window that reopening could bring back is on
@@ -362,8 +481,10 @@ impl<S: 'static> App<S> {
     /// hid last (closed with `keep_running`, or hidden), else the main window. It never brings
     /// back a launcher or other nonactivating panel, a window that closed for good, or anything
     /// in an accessory app. With several windows, every window's hook runs, in window order,
-    /// and any true skips the default. Never called on other platforms. Headless scripts
-    /// deliver it with `{"reopen": true}`.
+    /// and any true skips the default. Windows: runs when the app is launched again without a
+    /// link while it runs, once `rune::single_instance` made it the app's one process; the
+    /// default then also brings the front window forward, restored. Never called on other
+    /// platforms. Headless scripts deliver it with `{"reopen": true}`.
     pub fn on_reopen(mut self, f: fn(&mut S, bool, &mut Tx) -> bool) -> Self {
         self.on_reopen = Some(f);
         self
@@ -377,8 +498,13 @@ impl<S: 'static> App<S> {
     /// validate it before acting on it. Bringing a window forward is up to the app
     /// (`AppHandle::open`). The app's bundle must declare the scheme (`CFBundleURLTypes`, see
     /// the README). With several windows whose apps have the hook, the first still running
-    /// receives links. Never called on other platforms (Windows and Linux pass links to a new
-    /// process as arguments).
+    /// receives links.
+    ///
+    /// Windows: the links among the launch arguments (`scheme://…`), as Windows passes a link to
+    /// the process it starts, and with `rune::single_instance` the links of every later launch,
+    /// which that launch hands to this process instead of opening a window. The app registers its
+    /// scheme itself (`HKEY_CURRENT_USER\Software\Classes\<scheme>`, usually at install). Never
+    /// called on other platforms (Linux passes links to a new process as arguments).
     pub fn on_open_url(mut self, f: fn(&mut S, &str, &mut Tx)) -> Self {
         self.on_open_url = Some(f);
         self
@@ -472,17 +598,19 @@ impl<S: 'static> App<S> {
             self = self.menu_item(item);
         }
         self.playground = Some(playground);
+        self.attach_playground = Some(crate::playground::attach::<S>);
         self
     }
 
     /// Runs until the app quits. Agent-tooling arguments (`--snap`, `--tree`, ...) render
     /// headless instead: the window requests are ignored there, and updates apply each frame.
-    /// Panics when the app can't start, such as without a display; `try_run` returns that error.
+    /// Prints the error to stderr and exits 1 when the app can't start, such as without a
+    /// display (wasm32 has no process exit, so there it panics); `try_run` returns that error.
     pub fn run(self) {
-        if let Err(error) = self.try_run() { panic!("{error}"); }
+        crate::tooling::started(self.try_run());
     }
 
-    /// `run`, returning an error instead of panicking when the event loop can't start (no
+    /// `run`, returning an error instead of exiting when the event loop can't start (no
     /// display over ssh or in CI, no Wayland or X11 server) or fails.
     #[cfg(target_arch = "wasm32")]
     pub fn try_run(mut self) -> Result<(), String> {
@@ -499,8 +627,13 @@ impl<S: 'static> App<S> {
             None => Args::parse(),
         };
         if args.headless() {
-            crate::render::discard_prewarm();
-            crate::tooling::try_headless(self, args)
+            #[cfg(any(feature = "tooling", debug_assertions))]
+            {
+                crate::render::discard_prewarm();
+                crate::tooling::try_headless(self, args)
+            }
+            #[cfg(not(any(feature = "tooling", debug_assertions)))]
+            Err(crate::tooling::WITHOUT_TOOLING.into())
         } else {
             crate::window::run(self, args)
         }
@@ -554,7 +687,7 @@ impl<S: 'static> AppHandle<S> {
     /// nonactivating panel takes keys without activating. The window open at launch doesn't
     /// activate the app beyond what the platform does at launch.
     pub fn open(&self) {
-        self.request(|q| { q.window = Some(WindowRequest::Open(None)); q.minimize = false; });
+        self.request(|q| { q.window = Some(WindowRequest::Open(None)); q.cancel_minimize(); });
     }
 
     /// Show or recreate the window without requesting focus. A minimized window stays minimized;
@@ -565,13 +698,13 @@ impl<S: 'static> AppHandle<S> {
 
     /// Hide the window, retaining its host and state. Does not invoke the close callback.
     pub fn hide(&self) {
-        self.request(|q| { q.window = Some(WindowRequest::Hide); q.minimize = false; });
+        self.request(|q| { q.window = Some(WindowRequest::Hide); q.cancel_minimize(); });
     }
 
     /// Focus/activate an already-visible window, restoring it if minimized.
     /// On Wayland this requests attention; use activate(token) for compositor-authorized focus.
     pub fn focus(&self) {
-        self.request(|q| { q.focus = true; q.minimize = false; });
+        self.request(|q| { q.cancel_minimize(); q.activation = Some(Activation::Focus); });
     }
 
     /// Set the outer position in physical desktop pixels (negative coordinates are valid).
@@ -593,13 +726,13 @@ impl<S: 'static> AppHandle<S> {
     /// lets it take focus. Where tokens don't exist this is `open`.
     pub fn activate(&self, token: impl Into<String>) {
         let token = token.into();
-        self.request(|q| { q.window = Some(WindowRequest::Open(Some(token).filter(|t| !t.is_empty()))); q.minimize = false; });
+        self.request(|q| { q.window = Some(WindowRequest::Open(Some(token).filter(|t| !t.is_empty()))); q.cancel_minimize(); });
     }
 
     /// Close the window as the close button would (`App::on_close` runs; without
     /// `keep_running` the app quits).
     pub fn close(&self) {
-        self.request(|q| { q.window = Some(WindowRequest::Close); q.minimize = false; });
+        self.request(|q| { q.window = Some(WindowRequest::Close); q.cancel_minimize(); });
     }
 
     /// Minimize the window, as `Tx::minimize` does from a handler. Does nothing for a hidden
@@ -607,10 +740,11 @@ impl<S: 'static> AppHandle<S> {
     /// the shown window; a later `open`, `focus`, `hide` or `close` cancels it, and it cancels
     /// an earlier `focus`.
     pub fn minimize(&self) {
-        self.request(|q| { q.minimize = true; q.focus = false; });
+        self.request(|q| { q.activation = Some(Activation::Minimize); });
     }
 
-    /// Quit the app: the window closes without `on_close`, and `run` returns.
+    /// Quit the app: every open window's `App::on_quit` runs, the window closes without
+    /// `on_close`, and `run` returns.
     ///
     /// On web this unmounts the app: its loop stops, its GPU device is destroyed, its listeners
     /// come off the page, the body style and title it changed go back, and the canvas Rune made
@@ -619,7 +753,14 @@ impl<S: 'static> AppHandle<S> {
     /// app quit before it mounts never does.
     pub fn quit(&self) {
         self.shared.quitting.store(true, Ordering::Release);
-        self.request(|q| q.quit = true);
+        self.request(|q| q.quit = q.quit.max(Some(crate::quit::After::Exit)));
+    }
+
+    /// Quit the app as [`AppHandle::quit`] does, then start it again with the same arguments
+    /// once this process has exited ([`Tx::relaunch`]). Web: as `quit`.
+    pub fn relaunch(&self) {
+        self.shared.quitting.store(true, Ordering::Release);
+        self.request(|q| q.quit = Some(crate::quit::After::Relaunch));
     }
 
     /// macOS: show or hide the app's Dock icon (and app menu) while it runs, switching between
@@ -664,126 +805,8 @@ impl<S: 'static> AppHandle<S> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum WindowRequest {
-    /// Show and focus, with an activation token when one was forwarded.
-    Open(Option<String>),
-    Show,
-    Hide,
-    Close,
-}
-
-pub(crate) struct Requests<S> {
-    pub window: Option<WindowRequest>,
-    pub dock: Option<bool>,
-    pub focus: bool,
-    /// `AppHandle::minimize`, after `window`. It and `focus` are last-wins.
-    pub minimize: bool,
-    pub position: Option<(i32, i32)>,
-    pub place: Option<crate::windows::PlaceRequest>,
-    pub quit: bool,
-    /// `AppHandle::wake` asked for `poll`.
-    pub woken: bool,
-    pub updates: Vec<Update<S>>,
-}
-
-impl<S> Requests<S> {
-    /// Nothing but updates: no wake for `poll`, no window, focus or geometry request.
-    pub(crate) fn only_updates(&self) -> bool {
-        !self.woken && self.window.is_none() && !self.focus && !self.minimize && self.position.is_none() && self.place.is_none()
-    }
-}
-
-impl<S> Default for Requests<S> {
-    fn default() -> Self {
-        Requests {
-            window: None,
-            dock: None,
-            focus: false,
-            minimize: false,
-            position: None,
-            place: None,
-            quit: false,
-            woken: false,
-            updates: Vec::new(),
-        }
-    }
-}
-
-pub(crate) struct Shared<S> {
-    pub(crate) menus: crate::native_menu::Hub<S>,
-    pub(crate) shortcuts: crate::shortcuts::Hub<S>,
-    requests: Mutex<Requests<S>>,
-    wake: Mutex<Option<crate::runtime::Waker>>,
-    /// Published by the window host for `AppHandle::is_visible` / `window_error`.
-    pub(crate) visible: AtomicBool,
-    /// `AppHandle::quit` was called, or the web app is ending.
-    pub(crate) quitting: AtomicBool,
-    pub(crate) window_error: Mutex<Option<String>>,
-}
-
-impl<S> Default for Shared<S> {
-    fn default() -> Self {
-        Shared {
-            menus: crate::native_menu::Hub::default(),
-            shortcuts: crate::shortcuts::Hub::default(),
-            requests: Mutex::default(),
-            wake: Mutex::new(None),
-            visible: AtomicBool::new(false),
-            quitting: AtomicBool::new(false),
-            window_error: Mutex::new(None),
-        }
-    }
-}
-
-impl<S> Shared<S> {
-    /// Installs the event loop's wake-up and wakes it once for requests made before it existed.
-    pub fn connect(&self, wake: crate::runtime::Waker) {
-        *self.wake.lock().unwrap() = Some(wake);
-        self.wake();
-    }
-
-    pub fn wake(&self) {
-        let wake = self.wake.lock().unwrap().clone();
-        if let Some(wake) = wake {
-            wake();
-        }
-    }
-
-    pub fn take(&self) -> Requests<S> {
-        std::mem::take(&mut self.requests.lock().unwrap())
-    }
-
-    /// The queued updates alone; the other requests stay.
-    pub(crate) fn take_updates(&self) -> Vec<Update<S>> {
-        std::mem::take(&mut self.requests.lock().unwrap().updates)
-    }
-
-    /// Runs the queued updates with `run`, then takes the other requests, so a window an update
-    /// opens (or shows, focuses, places, quits) applies in this turn. Updates the updates queue
-    /// wait for the next turn, which their wake brings.
-    pub(crate) fn drain(&self, mut run: impl FnMut(Update<S>)) -> Requests<S> {
-        for f in self.take_updates() { run(f); }
-        let mut requests = self.requests.lock().unwrap();
-        let later = std::mem::take(&mut requests.updates);
-        std::mem::replace(&mut *requests, Requests { updates: later, ..Requests::default() })
-    }
-
-    /// Queues `f` for the next `take`, as `AppHandle::update_if` does, without waking the loop.
-    pub(crate) fn queue_update(&self, f: Update<S>) {
-        self.requests.lock().unwrap().updates.push(f);
-    }
-
-    /// A request a `--desktop` run applies to the window (dock and quit aside) waits for `take`.
-    pub(crate) fn window_pending(&self) -> bool {
-        let r = self.requests.lock().unwrap();
-        r.window.is_some() || r.focus || r.minimize || r.position.is_some() || r.place.is_some() || !r.updates.is_empty()
-    }
-
-    pub fn take_place(&self) -> Option<crate::windows::PlaceRequest> {
-        self.requests.lock().unwrap().place.take()
-    }
-}
+mod requests;
+pub(crate) use requests::{window_request_order, Activation, Requests, Shared, WindowRequest};
 
 #[cfg(test)]
 mod tests {
@@ -904,7 +927,7 @@ mod tests {
             Some(WindowRequest::Close),
             "window requests collapse to the latest"
         );
-        assert!(!requests.quit);
+        assert!(requests.quit.is_none());
         let mut n = 0;
         for f in requests.updates {
             f(&mut n, &mut Tx::default());
@@ -951,10 +974,10 @@ mod tests {
         }).join().unwrap();
         let requests = app.shared.take();
         assert_eq!(requests.window, Some(WindowRequest::Show), "focus must not overwrite show");
-        assert!(requests.focus);
+        assert_eq!(requests.activation, Some(Activation::Focus));
         assert_eq!(requests.position, Some((-300, 40)));
         let drained = app.shared.take();
-        assert!(!drained.focus && drained.window.is_none() && drained.position.is_none());
+        assert!(drained.activation.is_none() && drained.window.is_none() && drained.position.is_none());
     }
 
     #[test]
@@ -995,31 +1018,34 @@ mod tests {
         let mut rt = Runtime::new(0u32, |_: &u32, _: &mut Cx<u32>| el(), (100.0, 100.0), Env::default());
         rt.on_focus = Some(|_, focused, tx| if !focused { tx.minimize(); });
         rt.window_focus(true);
-        assert!(!rt.minimize_request);
+        assert!(!rt.minimize.latched());
         rt.window_focus(false);
-        assert!(rt.minimize_request && rt.shell_request.is_none(), "a handler's minimize is latched for the shell");
+        assert!(rt.minimize.field() && rt.shell_request.is_none(), "a handler's minimize is latched for the shell");
         rt.ignore_minimize("a test");
-        assert!(!rt.minimize_request, "a shell that can't minimize takes the request");
+        assert!(!rt.minimize.latched(), "a shell that can't minimize takes the request");
         rt.update(|_, tx| tx.minimize());
-        assert!(rt.minimize_request);
+        assert!(rt.minimize.field());
         let app = App::new(spec());
         app.handle().minimize();
         let requests = app.shared.take();
-        assert!(requests.minimize && requests.window.is_none());
+        assert!(requests.activation == Some(Activation::Minimize) && requests.window.is_none());
     }
 
     #[test]
     fn a_handles_minimize_and_focus_are_last_wins_and_hide_close_or_open_cancel_it() {
         let app = App::new(spec());
         let h = app.handle();
-        let after = |calls: &dyn Fn()| { calls(); let r = app.shared.take(); (r.window, r.focus, r.minimize) };
-        assert_eq!(after(&|| { h.focus(); h.minimize(); }), (None, false, true), "focus then minimize stays minimized");
-        assert_eq!(after(&|| { h.minimize(); h.focus(); }), (None, true, false));
-        assert_eq!(after(&|| { h.show(); h.minimize(); }), (Some(WindowRequest::Show), false, true), "shows, then minimizes");
-        assert_eq!(after(&|| { h.minimize(); h.show(); }), (Some(WindowRequest::Show), false, true));
-        assert_eq!(after(&|| { h.minimize(); h.hide(); }), (Some(WindowRequest::Hide), false, false));
-        assert_eq!(after(&|| { h.minimize(); h.close(); }), (Some(WindowRequest::Close), false, false));
-        assert_eq!(after(&|| { h.minimize(); h.open(); }), (Some(WindowRequest::Open(None)), false, false), "open restores");
+        let after = |calls: &dyn Fn()| { calls(); let r = app.shared.take(); (r.window, r.activation) };
+        assert_eq!(after(&|| { h.focus(); h.minimize(); }), (None, Some(Activation::Minimize)), "focus then minimize stays minimized");
+        assert_eq!(after(&|| { h.minimize(); h.focus(); }), (None, Some(Activation::Focus)));
+        assert_eq!(after(&|| { h.show(); h.minimize(); }), (Some(WindowRequest::Show), Some(Activation::Minimize)), "shows, then minimizes");
+        assert_eq!(after(&|| { h.minimize(); h.show(); }), (Some(WindowRequest::Show), Some(Activation::Minimize)));
+        assert_eq!(after(&|| { h.minimize(); h.hide(); }), (Some(WindowRequest::Hide), None));
+        assert_eq!(after(&|| { h.minimize(); h.close(); }), (Some(WindowRequest::Close), None));
+        assert_eq!(after(&|| { h.minimize(); h.open(); }), (Some(WindowRequest::Open(None)), None), "open restores");
+        assert_eq!(after(&|| { h.focus(); h.open(); }), (Some(WindowRequest::Open(None)), Some(Activation::Focus)), "open leaves a focus asked first");
+        assert_eq!(after(&|| { h.focus(); h.hide(); }), (Some(WindowRequest::Hide), Some(Activation::Focus)));
+        assert_eq!(after(&|| { h.minimize(); h.show(); h.focus(); }), (Some(WindowRequest::Show), Some(Activation::Focus)));
     }
 
     #[test]
@@ -1036,13 +1062,13 @@ mod tests {
         press(&mut rt, Code::KeyW, 'w', Unhandled::Close);
         assert_eq!(rt.shell_request.take(), Some(Shell::Close), "an unhandled ⌘W closes as the button would");
         press(&mut rt, Code::KeyM, 'm', Unhandled::Minimize);
-        assert!(std::mem::take(&mut rt.minimize_request) && rt.shell_request.is_none());
+        assert!(rt.minimize_step(crate::window::MinimizeEvent::Taken) && rt.shell_request.is_none());
         rt.on_key = Some(|n, ev, _| { *n += 1; ev.is_command('w') });
         press(&mut rt, Code::KeyW, 'w', Unhandled::Close);
         assert_eq!((rt.state, rt.shell_request), (1, None), "the app's own ⌘W wins, once");
         press(&mut rt, Code::KeyM, 'm', Unhandled::Minimize);
         assert_eq!(rt.state, 2, "the app saw ⌘M first");
-        assert!(rt.minimize_request, "and didn't take it");
+        assert!(rt.minimize.latched(), "and didn't take it");
     }
 
     thread_local! { static BUILDS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }

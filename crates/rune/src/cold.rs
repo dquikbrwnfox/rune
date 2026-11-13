@@ -17,9 +17,16 @@ impl<T: Empty> Default for Cold<T> {
 }
 
 impl<T: Empty> Cold<T> {
+    pub(crate) const NONE: Self = Cold(None);
+
     #[inline(always)]
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_none()
+    }
+
+    /// The value, moved out when this was its only owner.
+    pub(crate) fn into_owned(self) -> T {
+        self.0.map_or_else(|| T::EMPTY.clone(), Rc::unwrap_or_clone)
     }
 
     #[inline(always)]
@@ -69,6 +76,9 @@ pub(crate) struct SharedBox<T: Clone>(Rc<T>);
 
 impl<T: Clone> SharedBox<T> {
     pub(crate) fn new(value: T) -> Self { Self(Rc::new(value)) }
+
+    /// The value, copied only when something else shares it.
+    pub(crate) fn into_inner(self) -> T { Rc::unwrap_or_clone(self.0) }
 
     #[allow(dead_code)]
     pub(crate) fn ptr_eq(a: &Self, b: &Self) -> bool { Rc::ptr_eq(&a.0, &b.0) }

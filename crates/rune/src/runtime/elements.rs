@@ -57,6 +57,9 @@ pub struct ElementInfo {
     pub live_intent: u32,
     /// On the focused text field: its caret line in window points (see [`Cx::caret`]).
     pub caret: Option<[f32; 4]>,
+    /// On the focused text field, unless secure: its selection's anchor and focus, UTF-8 bytes
+    /// of its text (equal for a caret).
+    pub edit_range: Option<[usize; 2]>,
     /// Dragging it starts an OS drag ([`El::drag_out`]).
     pub drag_out: bool,
     /// Its tooltip and accessibility help ([`El::help`]).
@@ -145,6 +148,11 @@ impl<S: 'static> Runtime<S> {
             let path = self.node_index.get(&node).map_or_else(|| format!("node:{}", node.0), |&i| self.nodes[i].path.clone());
             (path, prop_name(p.0), store.is_active(track))
         }).collect();
+        // A growth row's feathered edge (`GrowTrack::mask`) paints as it eases out, after its height
+        // has landed: it is a track of its own here.
+        out.extend(self.grows.iter().filter(|(_, g)| g.mask > 0.01).filter_map(|(id, _)| {
+            self.node_index.get(id).map(|&i| (self.nodes[i].path.clone(), "mask", true))
+        }));
         out.sort();
         out.dedup();
         out
@@ -161,10 +169,10 @@ impl<S: 'static> Runtime<S> {
         self.nodes.iter().enumerate().filter(|&(i, n)| {
             let v = &n.vis;
             !parents[i] && n.text.is_none() && n.input.is_none() && !n.focus.enabled && n.material.is_none()
-                && v.fill.a == 0.0 && (v.border_width == 0.0 || v.border.a == 0.0 && v.border_bottom.is_none_or(|c| c.a == 0.0))
+                && v.fill.a == 0.0 && (v.border_width() == 0.0 || v.border().a == 0.0 && v.border_bottom.is_none_or(|c| c.a == 0.0))
                 && v.shadows.is_empty() && v.surface.is_none() && v.icon.is_none() && v.gradient.is_none() && v.radial.is_none()
-                && v.outline.is_none() && v.shape.is_none() && v.pixels.is_none() && v.effect.is_none()
-                && v.hover.a == 0.0 && v.press.a == 0.0
+                && v.outline.is_none() && v.shape.is_none() && v.grid.is_none() && v.pixels.is_none() && v.effect.is_none()
+                && v.hover().a == 0.0 && v.press().a == 0.0
         }).map(|(_, n)| n.path.as_str()).collect()
     }
 
@@ -199,7 +207,7 @@ impl<S: 'static> Runtime<S> {
                 crate::live::Property::Offset => 1,
                 crate::live::Property::Scale | crate::live::Property::Rect => 1 | 2,
                 crate::live::Property::Opacity => 4,
-                crate::live::Property::Fill | crate::live::Property::Blur | crate::live::Property::Trim => 0,
+                _ => 0,
             })
         }
         let store = self.scene.store();
@@ -232,18 +240,22 @@ impl<S: 'static> Runtime<S> {
                 let (x0, y0) = (rect[0].max(clip[0] / s), rect[1].max(clip[1] / s));
                 let (x1, y1) = ((rect[0] + rect[2]).min(clip[2] / s), (rect[1] + rect[3]).min(clip[3] / s));
                 let visible = [x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0)];
-                let revealing = flight.is_some() || self.reveals.get(&n.id).is_some_and(|r| !r.words.is_empty());
+                let revealing = flight.is_some() || self.reveals.get(&n.id).is_some_and(|r| r.fading());
                 let mut in_growing_row = false;
                 let mut scrolling = false;
                 let mut scrolled = [0.0; 2];
                 let mut live_intent = intent(n);
+                // Held at its landing width this frame: its re-layout is the design.
+                if self.landing_holds.holds(n.id) {
+                    live_intent |= 1 | 2;
+                }
                 // A group_opacity swap under an instant hover group is a deliberate cut (Beta's
                 // status/close swap), for it and what it contains: opacity and transition intent.
                 let up = |from: Option<usize>| std::iter::successors(from, |&pi| self.nodes[pi].parent);
                 if let Some(gi) = up(Some(i)).find(|&j| self.nodes[j].vis.group_opacity.is_some()) {
                     let group = up(self.nodes[gi].parent)
                         .map(|pi| &self.nodes[pi])
-                        .find(|g| g.vis.hover.a > 0.0 || g.vis.hover_group);
+                        .find(|g| g.vis.hover().a > 0.0 || g.vis_flags.hover_group());
                     if group.and_then(|g| g.hover_motion()).is_some_and(|(e, x)| [e, x].iter().any(|a| matches!(a.curve, rune_motion::Curve::Instant))) {
                         live_intent |= 4 | 16;
                     }
@@ -259,7 +271,7 @@ impl<S: 'static> Runtime<S> {
                         None => at.map_or(v, |at| self.content_to_window(at, v)),
                     };
                     if j != i && let Some(st) = self.scrolls.get(&self.nodes[j].id) {
-                        let [x, y] = to_window(Some(j), st.drawn);
+                        let [x, y] = to_window(Some(j), [st.drawn_x, st.drawn.y()]);
                         scrolled = [scrolled[0] + x, scrolled[1] + y];
                     }
                     // A launch, and what it carries, leaves under the offsets it launched against
@@ -278,7 +290,7 @@ impl<S: 'static> Runtime<S> {
                     let p = &self.nodes[pi];
                     moving |= animating(p.id)
                         || self.stacks.get(&p.id).is_some_and(|s| s.moving)
-                        || self.scrolls.get(&p.id).is_some_and(|s| s.slack.moving() || s.glide.is_some());
+                        || self.scrolls.get(&p.id).is_some_and(|s| s.slack.moving() || s.glide().is_some());
                     live_intent |= intent(p);
                     scrolling |= self.scrolls.get(&p.id).is_some_and(ScrollState::moving);
                     in_growing_row |= self.grows.get(&p.id).is_some_and(|g| g.moving());
@@ -293,18 +305,18 @@ impl<S: 'static> Runtime<S> {
                         else { l.phase(self.scene.store().node_time(n.id)) }
                     }),
                     focusable: self.can_focus(i),
-                    focused: self.focused.as_deref() == Some(&n.path),
-                    focus_visible: self.keyboard_focus && self.focused.as_deref() == Some(&n.path),
+                    focused: self.focus.path() == Some(&n.path),
+                    focus_visible: self.focus.keyboard() && self.focus.path() == Some(&n.path),
                     inert: !self.allowed(i) || exiting,
                     exiting,
                     path: n.path.clone(),
                     key: n.key.clone(),
                     role: n.role,
-                    label: n.label.clone(),
+                    label: n.label.as_deref().map(str::to_owned),
                     text: match &n.text {
                         Some(t) => (!secure).then(|| t.source_text().to_owned()),
                         // A text built from several (a rolling label's glyphs) reads as its label.
-                        None => (!secure).then(|| n.label.clone()).flatten().filter(|_| n.role == "text"),
+                        None => (!secure).then(|| n.label.as_deref().map(str::to_owned)).flatten().filter(|_| n.role == "text"),
                     },
                     rect,
                     target: [n.target[0], n.target[1], n.target[2] - n.target[0], n.target[3] - n.target[1]],
@@ -313,8 +325,9 @@ impl<S: 'static> Runtime<S> {
                     blur: if flight.is_some() { 0.0 } else { self.inh_scratch.get(i).map_or(p.blur, |h| h.blur) },
                     radius: p.radius.0[0],
                     fill: self.color(n.id, P_FILL, n.vis.fill),
-                    text_color: n.text.as_ref().map(|t| t.color).or(n.vis.icon.map(|(_, c)| c)).map(|c| self.color(n.id, P_TEXT, c)),
-                    hover: if n.focus.highlight.is_some() && self.highlight_visible(i) { 1.0 }
+                    text_color: paint_tracks::text_color(n)
+                        .map(|c| paint_tracks::group_tint(n, self.color(n.id, P_TEXT, c), self.inh_scratch.get(i).map_or(0.0, |h| h.group))),
+                    hover: if (n.focus.highlight.is_some() && self.highlight_visible(i)) || (n.focus.fill.is_some() && self.focus_ring_visible(i)) { 1.0 }
                         else { self.scene.get(n.id, P_HOVER).unwrap_or(0.0) },
                     press: self.scene.get(n.id, P_PRESS).unwrap_or(0.0),
                     moving,
@@ -326,8 +339,9 @@ impl<S: 'static> Runtime<S> {
                     scrolled,
                     live_intent,
                     caret: self.caret_rect(&self.nodes, i),
+                    edit_range: n.input.as_ref().filter(|inp| inp.edit.focused && !inp.edit.is_secure()).map(|inp| [inp.edit.anchor, inp.edit.focus]),
                     drag_out: n.handlers.drag_out.is_some(),
-                    help: n.help.as_ref().filter(|_| !n.help_cut || n.text_cut(s)).cloned(),
+                    help: n.help.as_deref().filter(|_| !n.help_cut || n.text_cut(s)).map(|h| crate::el::help_words(h).into_owned()),
                     selected: n.text.as_ref().filter(|t| t.selectable && !secure).and_then(|t| {
                         let (a, b) = selectable::range_in(&sel_ranges, i)?;
                         t.copy_slice(a as u32, b as u32)
@@ -337,7 +351,7 @@ impl<S: 'static> Runtime<S> {
                     item_selected: n.focus.selected,
                     stuck: self.stuck.get(i).copied().unwrap_or(0.0),
                     virtual_extent: self.virtuals.contains_key(&n.path) && n.vis.fill.a == 0.0
-                        && n.vis.border_width == 0.0 && n.vis.shadows.is_empty() && n.text.is_none() && n.vis.icon.is_none(),
+                        && n.vis.border_width() == 0.0 && n.vis.shadows.is_empty() && n.text.is_none() && n.vis.icon.is_none(),
                 })
             })
             .collect();
@@ -357,7 +371,7 @@ impl<S: 'static> Runtime<S> {
                 hover: 0.0, press: 0.0, moving: true, parent: None,
                 visible: [r.x.max(c[0]), r.y.max(c[1]), (r.edges()[2].min(c[2]) - r.x.max(c[0])).max(0.0),
                     (r.edges()[3].min(c[3]) - r.y.max(c[1])).max(0.0)],
-                revealing: true, in_growing_row: false, scrolling: false, scrolled: [0.0; 2], virtual_extent: false, live_intent: 0, caret: None, drag_out: false,
+                revealing: true, in_growing_row: false, scrolling: false, scrolled: [0.0; 2], virtual_extent: false, live_intent: 0, caret: None, edit_range: None, drag_out: false,
                 help: None, selected: None, level: None, expanded: None, item_selected: false, stuck: 0.0,
             });
         }
