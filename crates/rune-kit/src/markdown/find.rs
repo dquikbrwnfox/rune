@@ -14,6 +14,9 @@ pub enum Case {
     Insensitive,
     /// Exact code-point matching.
     Sensitive,
+    /// As a person expects in every language: case folding (`ß` as `ss`, Turkish `ı`), full-width
+    /// and half-width forms, and accents a query leaves out ([`crate::search`]).
+    Folded(crate::search::Fold),
 }
 
 impl Case {
@@ -65,6 +68,7 @@ impl Markdown {
 
 enum Needle<'a> {
     Sensitive(&'a str),
+    Folded(&'a str, crate::search::Fold),
     Insensitive { folded: String, ascii: bool },
 }
 
@@ -72,6 +76,7 @@ impl<'a> Needle<'a> {
     fn new(query: &'a str, case: Case) -> Self {
         match case {
             Case::Sensitive => Needle::Sensitive(query),
+            Case::Folded(fold) => Needle::Folded(query, fold),
             Case::Insensitive => {
                 let ascii = query.is_ascii();
                 let folded = if ascii {
@@ -102,6 +107,7 @@ fn find_in_blocks(src: &str, blocks: &[Block], maps: &[BlockMap], needle: &Needl
     for (b, map) in blocks.iter().zip(maps.iter().chain(std::iter::repeat(&empty))) {
         match (b, map) {
             (Block::Para(inl) | Block::Heading(_, inl), BlockMap::Inline(m)) => find_in_text(src, &inl.text, m, needle, out),
+            (Block::Image { alt, .. }, BlockMap::Inline(m)) => find_in_text(src, alt, m, needle, out),
             (Block::Code(code) | Block::Diff(code), BlockMap::Code(m)) => find_in_text(src, code, m, needle, out),
             (Block::Mermaid(code), BlockMap::Code(m)) => {
                 #[cfg(feature = "mermaid")]
@@ -181,6 +187,12 @@ fn find_in_text(src: &str, text: &str, map: &SpanMap, needle: &Needle<'_>, out: 
         Needle::Sensitive(q) => {
             for (v0, _) in vis.match_indices(q) {
                 let ranges = map_vis_range(src, &segments, &mut seg_idx, v0..v0 + q.len());
+                if !ranges.is_empty() { out.push(ranges); }
+            }
+        }
+        Needle::Folded(q, fold) => {
+            for r in fold.find(vis, q) {
+                let ranges = map_vis_range(src, &segments, &mut seg_idx, r);
                 if !ranges.is_empty() { out.push(ranges); }
             }
         }
@@ -404,7 +416,7 @@ fn map_segment(
 }
 
 fn is_pad_only(s: Option<&str>) -> bool {
-    s.is_some_and(|s| s == PAD || (!s.is_empty() && s.trim_matches('\u{202f}').is_empty()))
+    s.is_some_and(|s| s == PAD || (!s.is_empty() && s.trim_matches(['\u{202f}', '\u{2066}', '\u{2069}']).is_empty()))
 }
 
 fn span_bounds(ranges: &[Range<usize>]) -> Range<usize> {

@@ -1,30 +1,15 @@
 //! Render-side growth, scroll and streaming word-reveal tracks, plus animated paint samples.
 use super::*;
+use crate::runtime::scroll_mode::{self, Event as ModeEvent};
 
 /// Scroll momentum decay (iOS normal: 0.998 per ms).
 pub(super) const SCROLL_DECAY: f32 = 2.002;
-
-fn ease_out(x: f32) -> f32 {
-    let x = x.clamp(0.0, 1.0);
-    1.0 - (1.0 - x) * (1.0 - x) * (1.0 - x)
-}
-
-pub(super) fn word_starts(s: &str, from: usize, out: &mut Vec<u32>) {
-    let mut prev_space = true;
-    for (i, c) in s[from..].char_indices() {
-        let space = c.is_whitespace();
-        if !space && prev_space {
-            out.push((from + i) as u32);
-        }
-        prev_space = space;
-    }
-}
 
 /// The (x, y) scroll offsets of node `i`'s scroll viewports, innermost first.
 pub(super) fn scroll_offsets<'a>(scrolls: &'a HashMap<NodeId, ScrollState>, nodes: &'a [Node], i: usize) -> impl Iterator<Item = [f32; 2]> + 'a {
     std::iter::successors(Some(i), |&p| nodes[p].parent.filter(|_| nodes[p].above.is_none()))
         .skip(1)
-        .filter_map(|p| scrolls.get(&nodes[p].id).map(|st| [st.x.offset as f32, st.offset as f32]))
+        .filter_map(|p| scrolls.get(&nodes[p].id).map(|st| [st.x.shift() as f32, st.offset as f32]))
 }
 
 /// Marks every ancestor of a marked node.
@@ -80,9 +65,12 @@ impl<S: 'static> Runtime<S> {
             let n_rows = stack.order.len();
             let mut st_growing = !stack.pending_heights.is_empty();
             let mut st_moving = st_growing;
+            let (in_runs, run_grown) = Self::step_growth_runs(stack, &mut self.grows, steps.min(240), spec);
+            stack.grown += run_grown;
             for (k, id) in stack.order.iter().enumerate() {
                 let Some(g) = self.grows.get_mut(id) else { continue };
                 let h0 = g.h;
+                let in_run = in_runs.contains(id);
                 if let Some(&at) = stack.closing.get(id)
                     && now >= at
                 {
@@ -94,14 +82,21 @@ impl<S: 'static> Runtime<S> {
                 }
                 // A row above the tail (the last row) carries it.
                 let carrying = k + 2 == n_rows;
-                for substep in 0..steps.min(240) {
+                for substep in 0..if in_run { 0 } else { steps.min(240) } {
                     if !stack.pending_heights.is_empty() {
                         let at = now - f64::from(self.grow_acc) - f64::from((steps.min(240) - substep) as f32 * SUBSTEP);
-                        if at >= stack.width_hold_until && let Some(height) = stack.pending_heights.remove(id) {
+                        if !stack.width_hold.defers(at) && let Some(height) = stack.pending_heights.remove(id) {
                             g.retarget(height);
                         }
                     }
                     g.step(spec.spring, &spec.edge, carrying);
+                }
+                // A row nobody saw last frame draws no feather: it has none to ease, and grows one
+                // again as it comes into view.
+                if g.mask > 0.0 && self.built
+                    && self.node_index.get(id).is_some_and(|&i| !self.seen.get(i).copied().unwrap_or(true))
+                {
+                    g.mask = 0.0;
                 }
                 let r = std::mem::take(&mut g.restore);
                 if r > 0.0 { restored.push((ci, *id, r)); }
@@ -167,45 +162,42 @@ impl<S: 'static> Runtime<S> {
                 moving |= active;
                 continue;
             }
-            let held = (!self.keeps.is_empty() || !self.scroll_reveals.is_empty()) && {
+            let held = !self.requests.is_empty() && {
                 let path = &self.nodes[i].path;
-                (self.keeps.iter().any(|k| k.viewport == *path) || self.scroll_reveals.iter().any(|r| r.viewport == *path))
+                self.requests.owns(path)
                     && self.scroll_stack(i).and_then(|c| self.stacks.get(&self.nodes[c].id)).is_some_and(|s| s.growing)
             };
             let laid = if axes.y() { self.ease_to_shrunk_end(i, overflow) } else { None };
             let Some(st) = self.scrolls.get_mut(&id) else { continue };
-            st.scrolling = st.direct || st.v.abs() > 1.0 || st.x.v.abs() > 1.0;
-            st.by_hand |= st.scrolling;
-            st.direct = false;
+            let _ = scroll_mode::step(&mut st.mode, ModeEvent::Step { x_v: st.x.v });
             st.max = overflow.max(0.0);
-            if st.pinned && sp.stick_bottom {
-                // A reader stuck on a shrinking stack's end doesn't rise with its rows' last fraction.
-                st.offset = laid.filter(|&end| st.offset <= end + 1e-6).map_or(st.max, |end| st.max.min(end));
-                st.v = 0.0;
-                st.glide = None;
-            } else if st.glide.is_some() {
-                moving |= scroll_bottom::glide(st, dt);
-            } else if st.v.abs() > 1.0 {
-                // Exact for exponential decay, so a long frame carries the same distance as
-                // the short frames it stands for.
-                let decay = (-SCROLL_DECAY * dt).exp();
-                st.offset += f64::from(st.v * (1.0 - decay) / SCROLL_DECAY);
-                st.v *= decay;
-                if st.offset <= 0.0 || st.offset >= st.max {
-                    st.v = 0.0;
+            match st.mode {
+                ScrollMode::Pinned(_) if sp.stick_bottom => {
+                    // A reader stuck on a shrinking stack's end doesn't rise with its rows' last fraction.
+                    st.offset = laid.filter(|&end| st.offset <= end + 1e-6).map_or(st.max, |end| st.max.min(end));
                 }
-                moving = true;
-            } else {
-                st.v = 0.0;
+                ScrollMode::Glide { .. } => moving |= scroll_bottom::glide(st, dt),
+                ScrollMode::Momentum { v, .. } if v.abs() > 1.0 => {
+                    // Exact for exponential decay, so a long frame carries the same distance as
+                    // the short frames it stands for.
+                    let decay = (-SCROLL_DECAY * dt).exp();
+                    st.offset += f64::from(v * (1.0 - decay) / SCROLL_DECAY);
+                    let edge = st.offset <= 0.0 || st.offset >= st.max;
+                    st.mode = if edge { st.mode.to_rest() } else { st.mode.to_momentum(v * decay) };
+                    moving = true;
+                }
+                ScrollMode::Momentum { .. } => st.mode = st.mode.to_rest(),
+                ScrollMode::Pinned(_) | ScrollMode::Rest(_) => {}
             }
             st.offset = st.offset.clamp(0.0, st.max);
             // Landed on a shrinking stack's new end: stick once its rows are within half a point
-            // of it, not while they're still short of it.
+            // of it, not while they're still short of it. A glide that reaches the end hands it
+            // to the pin.
             let shrinking = laid.is_some_and(|end| end < st.max - 0.5 && st.offset < st.max - 1e-3);
-            if sp.stick_bottom && !held && !shrinking && st.offset >= st.max - 0.5 && st.v.abs() <= 1.0 {
-                st.pinned = true;
+            if sp.stick_bottom && !held && !shrinking && st.glide().is_none() && st.offset >= st.max - 0.5 && st.coast().abs() <= 1.0 {
+                st.pin();
             }
-            st.laid = laid;
+            let _ = scroll_mode::step(&mut st.mode, ModeEvent::Laid(laid));
             if sp.stick_bottom && axes.y() && slack_dt > 0.0 { moving |= self.step_slack(i, slack_dt); }
         }
         moving
@@ -216,26 +208,9 @@ impl<S: 'static> Runtime<S> {
         let mut any = false;
         for (id, st) in self.reveals.iter_mut() {
             let now = store.node_time(*id);
-            let fade = st.fade as f64;
-            // Words fully shown leave the list (only from the front, which keeps lookups valid).
-            let done = st.words.iter().take_while(|w| now - w.1 >= fade).count();
-            if done > 0 && done == st.words.len() {
-                st.words.clear();
-            }
-            any |= !st.words.is_empty() && store.node_time_scale(*id) > 0.0;
+            st.step(RevealEvent::Tick { now });
+            any |= st.fading() && store.node_time_scale(*id) > 0.0;
         }
         any
-    }
-
-    pub(super) fn reveal_alpha(st: &RevealState, byte: u32, now: f64) -> f32 {
-        let i = st.words.partition_point(|w| w.0 <= byte);
-        if i == 0 {
-            return 1.0;
-        }
-        let t0 = st.words[i - 1].1;
-        if st.fade <= 0.0 {
-            return if now >= t0 { 1.0 } else { 0.0 };
-        }
-        ease_out(((now - t0) / st.fade as f64) as f32)
     }
 }

@@ -55,14 +55,11 @@ impl<S: 'static> Runtime<S> {
             let end = st.offset;
             let reach = scroll_bottom::GLIDE_REACH * viewport;
             st.offset = start.clamp(end - reach, end + reach);
-            st.glide_to = Some(end);
-            st.glide = Some(scroll_offset::retarget_v(motion::GLIDE, st.offset, v.unwrap_or(0.0), end));
+            st.mode = st.mode.to_glide(scroll_offset::retarget_v(motion::GLIDE, st.offset, v.unwrap_or(0.0), end), GlideTo::Offset(end));
             st.spring = None;
-            st.shrink_glide = false;
-            st.pinned = false;
-            st.direct = true;
+            st.moved();
             if self.virtual_window_changed() {
-                self.commit(&Tx { instant: true, ..Tx::default() });
+                self.commit(&Tx { commit: Commit::Instant, ..Tx::default() });
             }
         }
         self.reveal_row_x(scope, key);
@@ -141,49 +138,37 @@ impl<S: 'static> Runtime<S> {
         let stick = self.nodes[s_idx].scroll.is_some_and(|s| s.stick_bottom);
         let max = self.scroll_overflow(s_idx).max(0.0);
         let Some(scroll) = self.scrolls.get_mut(&id) else { return (false, None) };
-        let was = first.then_some(Was { id, offset: scroll.offset, glide: scroll.glide, viewport });
+        let was = first.then_some(Was { id, offset: scroll.offset, glide: scroll.glide(), viewport });
         scroll.max = max;
-        if first {
-            scroll.v = 0.0;
-            scroll.glide = None;
-            scroll.glide_to = None;
-        }
+        if first { scroll.halt(); }
         let offset = place(center, scroll.offset, top, height, viewport, margin).clamp(0.0, scroll.max);
         let laid_max = (laid_end - viewport).max(0.0);
         let laid_to = place(center, scroll.offset, laid_top, laid_h, viewport, margin).clamp(0.0, laid_max);
-        let at_end = stick && (scroll.pinned || offset >= scroll.max - 0.5) && laid_to >= laid_max - 0.5;
-        if first {
-            self.scroll_reveals.retain(|r| r.viewport != path);
-            self.scroll_reveals.push(sticky::Reveal {
-                scope: scope.map(str::to_owned),
-                key: key.to_owned(),
-                viewport: path.clone(),
-                center,
-                at_end,
-            });
-        } else if let Some(r) = self.scroll_reveals.iter_mut().find(|r| r.viewport == path) {
-            r.at_end |= at_end;
+        let at_end = stick && (scroll.pinned() || offset >= scroll.max - 0.5) && laid_to >= laid_max - 0.5;
+        let effects = self.requests.step(requests::Event::Place { first, scope, key, viewport: &path,
+            center, at_end, from: scroll.offset, to: offset });
+        let Some(effect) = effects.into_iter().next() else { return (false, was) };
+        match effect {
+            requests::Effect::Move(to) => {
+                scroll.offset = to;
+                scroll.mode = scroll.mode.to_rest();
+                scroll.moved();
+            }
+            requests::Effect::Rest => {
+                scroll.mode = scroll.mode.to_rest();
+                return (false, was);
+            }
         }
-        if (offset - scroll.offset).abs() < 0.5 {
-            if first { scroll.pinned = false; }
-            return (false, was);
-        }
-        scroll.offset = offset;
-        scroll.pinned = false;
-        scroll.v = 0.0;
-        scroll.glide = None;
-        scroll.glide_to = None;
-        scroll.direct = true;
         let window = self.virtual_window_changed();
         if window {
-            self.commit(&Tx { instant, ..Tx::default() });
+            self.commit(&Tx { commit: if instant { Commit::Instant } else { Commit::Animate }, ..Tx::default() });
             // The commit measured rows that were estimates: the next placement clamps to the end
             // they make.
             if let Some(i) = self.nodes.iter().position(|n| n.id == id) {
                 let max = self.scroll_overflow(i).max(0.0);
                 if let Some(scroll) = self.scrolls.get_mut(&id) {
                     scroll.max = max;
-                    scroll.pinned = false;
+                    scroll.mode = scroll.mode.to_rest();
                 }
             }
         }

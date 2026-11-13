@@ -41,8 +41,21 @@ pub(super) fn sync_chrome<S: 'static>(rt: &mut Runtime<S>, w: &Win, chrome: Chro
     let caption = caption(w, height);
     let scale = w.window.scale_factor() as f32;
     let height = height.filter(|_| custom_frame(w)).unwrap_or(0.0);
-    rt.set_chrome_insets(crate::ChromeInsets::new(leading, caption.map_or(0.0, |c| c.width(scale)), height));
+    let buttons = caption.map_or(0.0, |c| c.width(scale));
+    // The traffic lights' room is on the right in a right-to-left app on macOS, as the caption
+    // buttons' is on the left on Windows.
+    let (left, right) = if lights_right(w) { (0.0, leading) } else { (leading, 0.0) };
+    let (left, right) = if caption.is_some_and(|c| c.mirrored) { (left + buttons, right) } else { (left, right + buttons) };
+    rt.set_chrome_insets(crate::ChromeInsets::new(left, right, height));
     rt.set_caption(caption);
+}
+
+/// The traffic lights sit at the window's right: a right-to-left app on macOS.
+fn lights_right(w: &Win) -> bool {
+    #[cfg(target_os = "macos")]
+    return mac::traffic_lights_right(&w.window);
+    #[cfg(not(target_os = "macos"))]
+    { let _ = w; false }
 }
 
 /// Whether Rune replaced the native title bar: macOS draws the app's titlebar under its
@@ -85,18 +98,31 @@ pub(super) fn toggle_maximized(window: &Window) {
     }
 }
 
+/// Shows a window that opens maximized or full screen that way (`App::maximized`,
+/// `App::full_screen`): maximized first, so leaving full screen returns to it.
+#[cfg(target_os = "windows")]
+pub(super) fn open_as(window: &Window, open_as: crate::windows::OpenAs) {
+    if open_as.maximizes() { window.set_maximized(true); }
+    if open_as.full_screens() { window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None))); }
+}
+
 /// Takes the window full screen, borderless over its display, or brings it back.
 pub(super) fn toggle_full_screen(window: &Window) {
     let full = window.fullscreen().is_some();
     window.set_fullscreen((!full).then_some(winit::window::Fullscreen::Borderless(None)));
 }
 
-/// The window menu, where a custom titlebar (at the pointer) or the keyboard opens it.
-pub(super) fn window_menu(window: &Window, menu: crate::runtime::WindowMenu) {
+/// The window menu, where a custom titlebar (at `at`, the click's point in window points, else
+/// the pointer) or the keyboard opens it.
+pub(super) fn window_menu(window: &Window, menu: crate::runtime::WindowMenu, at: Option<(f32, f32)>) {
     #[cfg(target_os = "windows")]
-    crate::platform::win32::window_menu(window, menu);
+    {
+        let scale = window.scale_factor();
+        let at = at.zip(window.inner_position().ok()).map(|((x, y), o)| (o.x + (f64::from(x) * scale).round() as i32, o.y + (f64::from(y) * scale).round() as i32));
+        crate::platform::win32::window_menu(window, menu, at);
+    }
     #[cfg(not(target_os = "windows"))]
-    let _ = (window, menu);
+    let _ = (window, menu, at);
 }
 
 /// Whether Alt+Space opens this window's window menu when no handler takes it.

@@ -56,6 +56,11 @@ impl Uploads {
         self.staging.get_or_insert_with(|| Staging::new(device, queue)).clone()
     }
 
+    /// Frees the staging chunks kept for reuse (`Renderer::give_back`).
+    pub(super) fn trim(&self) {
+        if let Some(staging) = &self.staging { staging.trim(); }
+    }
+
     #[cfg(test)]
     pub(super) fn stats(&self) -> rune_staging::Stats {
         self.staging.as_ref().map(Staging::stats).unwrap_or_default()
@@ -90,13 +95,16 @@ fn same(a: &[Instance], b: &[Instance]) -> bool {
 fn pack((w, h): (u32, u32)) -> u64 { u64::from(w) << 32 | u64::from(h) }
 
 impl Renderer {
-    /// Records pending uploads into `encoder`, ahead of the renderer's commands in it.
+    /// Records pending uploads into `encoder`, ahead of the renderer's commands in it, and the
+    /// atlas fills staged after them.
     pub(super) fn flush_uploads(&self, encoder: &mut wgpu::CommandEncoder) {
         if let Some(s) = &self.uploads.staging { s.flush(encoder); }
+        self.encode_fills(encoder);
     }
 
-    /// Submits pending uploads ahead of commands already recorded.
+    /// Submits pending uploads (and atlas fills) ahead of commands already recorded.
     pub(super) fn submit_uploads(&self) {
+        if self.fills.lock().unwrap_or_else(|e| e.into_inner()).is_some() { return self.submit_fills(); }
         if let Some(s) = &self.uploads.staging { s.submit(); }
     }
 
@@ -139,7 +147,7 @@ impl Renderer {
             if page.data.is_empty() { changed |= self.images[index].is_some(); self.images[index] = None; continue; }
             if self.images[index].as_ref().is_none_or(|(t, _)| t.width() != page.width || t.height() != page.height) {
                 let texture = Self::image_texture(device, page.width, page.height);
-                let bind = Self::bind_group(device, &self.bind_layout, &self.globals, &self.atlas, &texture, None);
+                let bind = Self::bind_group(device, &self.bind_layout, &self.globals, self.uber.outlines(), &self.atlas, &texture, None);
                 self.images[index] = Some((texture, bind));
                 changed = true;
                 page.dirty = Some((0, page.height));
@@ -198,21 +206,38 @@ impl Renderer {
             self.uploads.lost.0 = staging.lost();
             self.resend_uploads(atlas);
         }
-        if let Some(rows) = atlas.dirty.take() { Self::write_rows(&staging, &self.atlas, &atlas.data, rows); }
+        // The Windfoil shader, built the first time text draws from outlines (render/variant.rs),
+        // fills atlas pages on the GPU, so the pages are made again as ones it can draw into.
+        if atlas.outlines.has_records() && self.select(device, variant::Event::OutlinesWanted) {
+            self.atlas = Self::atlas_texture(device, true);
+            for page in &mut self.atlas_pages { page.0 = Self::atlas_texture(device, true); }
+            self.rebind_all(device);
+            atlas.invalidate();
+        }
+        atlas.outlines.set_support(self.uber.support());
+        self.lcd_frame = self.lcd_ready(device, atlas.lcd_wanted) && atlas.lcd;
+        if let Some(rows) = atlas.dirty.take() {
+            atlas.rows_uploaded(0, rows);
+            Self::write_rows(&staging, &self.atlas, &atlas.data, rows);
+        }
         let mut atlas_changed = self.atlas_pages.len() > atlas.pages.len();
         self.atlas_pages.truncate(atlas.pages.len());
-        for (index, page) in atlas.pages.iter_mut().enumerate() {
+        let filled = self.uber.outlines().is_some();
+        for index in 0..atlas.pages.len() {
             if index >= self.atlas_pages.len() {
-                let texture = Self::texture(device, "glyph atlas", wgpu::TextureFormat::R8Unorm, ATLAS_SIZE, ATLAS_SIZE);
-                let bind = Self::bind_group(device, &self.bind_layout, &self.globals, &texture, &texture, None);
+                let texture = Self::atlas_texture(device, filled);
+                let bind = Self::bind_group(device, &self.bind_layout, &self.globals, self.uber.outlines(), &texture, &texture, None);
                 self.atlas_pages.push((texture, bind));
                 atlas_changed = true;
             }
-            if let Some(rows) = page.dirty.take() {
-                Self::write_rows(&staging, &self.atlas_pages[index].0, &page.data, rows);
+            if let Some(rows) = atlas.pages[index].dirty.take() {
+                atlas.rows_uploaded(index + 1, rows);
+                Self::write_rows(&staging, &self.atlas_pages[index].0, &atlas.pages[index].data, rows);
             }
         }
         if atlas_changed { self.images_changed(); }
+        self.upload_outlines(device, &staging, atlas);
+        self.fill_atlas(device, queue, &staging, atlas);
         if instances.len() > self.capacity {
             self.capacity = instances.len().next_power_of_two();
             self.instances = Self::instance_buffer(device, self.capacity);
@@ -249,11 +274,48 @@ impl Renderer {
             }
         }
         self.prepare_backdrop_blur(device, queue, viewport);
+        #[cfg(all(feature = "alloc-sites", not(target_arch = "wasm32")))]
+        self.report_pools();
+    }
+
+    /// A window's or overlay's first native surface: its renderer's pipeline compiles on a thread
+    /// of its own, and `done` runs once it's ready (the window's live wake, so the next frame
+    /// draws it). Until then `prepare_surfaces` draws no surface: a clip that's opening has no
+    /// picture yet anyway. Without this call, `prepare_surfaces` compiles in place.
+    pub(crate) fn build_surfaces(&mut self, device: &wgpu::Device, draws: &[crate::native_surface::SurfaceDraw], done: impl FnOnce() + Send + 'static) {
+        if draws.is_empty() || self.surfaces.is_some() || self.surfaces_building.is_some() { return; }
+        self.surfaces_building = Some(crate::native_surface::SurfaceRenderer::build(device, self.format, Box::new(done)));
+    }
+
+    /// Punches these native surfaces' places out of the window's pixels from the next
+    /// `prepare_surfaces` on, for clips shown on their own layer underneath (Windows).
+    #[cfg(target_os = "windows")]
+    pub(crate) fn set_punched_surfaces(&mut self, keys: Vec<usize>) {
+        if let Some(s) = &mut self.surfaces { s.set_punched(keys); }
+    }
+
+    /// The punch pipeline has compiled (`set_punched_surfaces`).
+    #[cfg(target_os = "windows")]
+    pub(crate) fn surface_punch_ready(&mut self) -> bool {
+        self.surfaces.as_mut().is_some_and(crate::native_surface::SurfaceRenderer::punch_ready)
+    }
+
+    /// Whether the last frame drew surface `key` inside an isolated layer; None when it didn't
+    /// draw it.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn surface_drew_isolated(&self, key: usize) -> Option<bool> {
+        self.surfaces.as_ref().and_then(|s| s.drew_isolated(key))
     }
 
     pub fn prepare_surfaces(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, draws: &[crate::native_surface::SurfaceDraw], viewport: (u32,u32)) {
-        if !draws.is_empty() && self.surfaces.is_none() {
-            let mut surfaces = crate::native_surface::SurfaceRenderer::new(device, self.format);
+        let built = match &self.surfaces_building {
+            Some(building) => crate::native_surface::SurfaceRenderer::finish(device, building),
+            None => None,
+        };
+        if built.is_some() { self.surfaces_building = None; }
+        if self.surfaces.is_none() && self.surfaces_building.is_some() { return; }
+        if (!draws.is_empty() || built.is_some()) && self.surfaces.is_none() {
+            let mut surfaces = built.unwrap_or_else(|| crate::native_surface::SurfaceRenderer::new(device, self.format));
             surfaces.set_srgb_blend(self.srgb_blend);
             surfaces.set_staging(self.uploads.staging(device, queue));
             for (format, _) in &self.extra { surfaces.add_format(device, *format); }
@@ -382,8 +444,8 @@ impl Renderer {
         self.uploads.forget_instances();
         self.uploads.viewport.store(u64::MAX, Ordering::Relaxed);
         self.uploads.srgb = None;
-        atlas.dirty = Some((0, ATLAS_SIZE));
-        for page in &mut atlas.pages { page.dirty = Some((0, ATLAS_SIZE)); }
+        atlas.resend_rows();
+        atlas.outlines.invalidate();
         self.layers.forget_blur_uniforms();
     }
 }

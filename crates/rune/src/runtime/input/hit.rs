@@ -150,7 +150,7 @@ impl<S: 'static> Runtime<S> {
             let n = &self.nodes[i];
             // A secondary-only child must not obscure primary input or background blur.
             (!self.subtree_exiting(i) && self.allowed(i) && (n.has_primary_handler() || n.input.is_some() || n.role == "textbox"
-                || (n.role == "button" && n.vis.hit) || n.window_drag != crate::el::WindowDrag::None || n.focus.enabled || n.handlers.modal.is_some()
+                || (n.role == "button" && n.vis_flags.hit()) || n.window_drag != crate::el::WindowDrag::None || n.focus.enabled || n.handlers.modal.is_some()
                 || self.is_selectable(i))).then_some(i)
         })
     }
@@ -171,6 +171,25 @@ impl<S: 'static> Runtime<S> {
             p = self.nodes[a].parent;
         }
         Some(i)
+    }
+
+    /// A focusable scroll region, which a press on plain content inside it focuses, as a web
+    /// page focuses a `tabIndex` scroller.
+    pub(super) fn focuses_on_click(&self, i: usize) -> bool {
+        self.nodes[i].scroll.is_some() && self.nodes[i].focus.enabled
+    }
+
+    /// The focusable scroll region a press at (x, y) lands in beneath `layer`
+    /// (`El::press_focuses_below`): the topmost element there outside the layer, or the nearest
+    /// region holding it.
+    pub(super) fn scroll_region_below(&self, layer: usize, x: f32, y: f32) -> Option<usize> {
+        let in_layer = |i: usize| std::iter::successors(Some(i), |&p| self.nodes[p].parent).any(|p| p == layer);
+        let under = self.hits.iter().rev().find_map(|&(id, r)| {
+            if !self.hit_contains(id, r, x, y) { return None; }
+            let i = *self.node_index.get(&id)?;
+            (!in_layer(i) && !self.subtree_exiting(i) && self.allowed(i)).then_some(i)
+        })?;
+        std::iter::successors(Some(under), |&p| self.nodes[p].parent).find(|&p| self.focuses_on_click(p) && self.can_focus(p))
     }
 
     /// The selectable text under (x, y), if it's the topmost thing there that takes input.
@@ -198,7 +217,7 @@ impl<S: 'static> Runtime<S> {
         let s = self.env.scale;
         let n = &self.nodes[i];
         let hits_before = self.hits.len();
-        if (n.vis.hit || n.handlers.get().is_some_and(crate::el::Handlers::takes_hit) || n.input.is_some() || n.role == "textbox" || n.window_drag != crate::el::WindowDrag::None || n.focus.get().is_some_and(|f| f.enabled)
+        if (n.vis_flags.hit() || n.handlers.get().is_some_and(crate::el::Handlers::takes_hit) || n.input.is_some() || n.role == "textbox" || n.window_drag != crate::el::WindowDrag::None || n.focus.get().is_some_and(|f| f.enabled)
             || n.text.as_ref().is_some_and(|t| t.selectable))
             && !self.subtree_exiting(i)
             && self.allowed(i) && effective_opacity > 0.001 && visible
@@ -218,7 +237,7 @@ impl<S: 'static> Runtime<S> {
             let rect = if n.parent.is_some() { cr } else { rect_pt };
             if !self.push_link_hits(i, rect_pt, rect) { self.hits.push((self.nodes[i].id, rect)); }
             let n = &self.nodes[i];
-            if n.vis.hit && effective_opacity > 0.0 && rect[2] > rect[0] && rect[3] > rect[1] {
+            if n.vis_flags.hit() && effective_opacity > 0.0 && rect[2] > rect[0] && rect[3] > rect[1] {
                 self.overlay_hits.push(self.hit_screen_rect(n.id, rect));
             }
         }
@@ -227,7 +246,7 @@ impl<S: 'static> Runtime<S> {
             let r = [rect_pt[0].max(c[0] / s), rect_pt[1].max(c[1] / s), rect_pt[2].min(c[2] / s), rect_pt[3].min(c[3] / s)];
             self.push_help_hit(i, r, hits_before);
         }
-        if self.nodes[i].text.as_ref().is_some_and(|t| t.links.iter().any(|l| l.help.is_some())) && !self.subtree_exiting(i) && self.allowed(i) && effective_opacity > 0.001 && visible {
+        if self.nodes[i].text.as_ref().is_some_and(|t| t.cold.links.iter().any(|l| l.help.is_some())) && !self.subtree_exiting(i) && self.allowed(i) && effective_opacity > 0.001 && visible {
             let c = if self.nodes[i].parent.is_some() { pinh_clip } else { NO_CLIP };
             self.push_link_help_hits(i, rect_pt, [c[0] / s, c[1] / s, c[2] / s, c[3] / s], hits_before);
         }

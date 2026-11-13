@@ -26,7 +26,10 @@ pub(super) enum Action {
     Visible(String, bool),
     Press(String, crate::PointerButton),
     DoublePress(String),
-    Link(String, usize),
+    /// `El::on_middle_press`.
+    MiddlePress(String),
+    /// A text's link and the button that clicked it (the primary or the middle).
+    Link(String, usize, crate::PointerButton),
     /// `El::on_link_secondary`: the text, its link and the press.
     LinkSecondary(String, usize, PointerEvent),
     SecondaryPress(String, PointerEvent),
@@ -41,16 +44,22 @@ pub(super) enum Action {
     Key { ev: KeyEvent, repeat: bool, stage: bool },
     KeyUp(KeyEvent),
     /// A wheel delta at window point (x, y) for the `on_wheel` handlers at the pointer,
-    /// innermost first (`runtime/input/gesture.rs`).
-    Wheel(u64, Vec<String>, crate::WheelEvent),
+    /// innermost first, with the gesture's own axis policy: whether the platform reported its
+    /// phases (`runtime/input/gesture.rs`).
+    Wheel { gesture: crate::machine::Attempt, chain: Vec<String>, ev: crate::WheelEvent, phased: bool },
     Gesture(Vec<String>, gesture_dispatch::Gesture),
     Ime(Ime),
+    /// The window went inactive: an open composition becomes text (`Runtime::finish_composition`).
+    FinishIme,
     Paste(crate::ClipboardContent, Option<Option<String>>),
     /// A `Tx::read_clipboard` callback's id and what the clipboard held.
     ClipboardRead(u64, crate::ClipboardContent),
     /// A `Tx::open_file` or `Tx::save_file` callback's id and the dialog's answer.
     FileDialog(u64, crate::file_dialog::FileDialogResult),
     Focus(String, f32, f32),
+    /// A text field's menu: the field, the window point it opens at, and where in the field a
+    /// press asked for it (none from the keyboard).
+    FieldMenu(String, (f32, f32), Option<(f32, f32)>),
     Blur,
     /// What assistive technology asked of an element (`a11y/actions.rs`).
     A11y(String, A11yAct),
@@ -116,6 +125,7 @@ pub(super) fn live_only_handler(action: &Action) -> Option<&'static str> {
         Action::SelectionChange(..) => "on_selection_change",
         Action::Press(..) => "on_press",
         Action::DoublePress(_) => "on_double_press",
+        Action::MiddlePress(_) => "on_middle_press",
         Action::Link(..) => "on_link",
         Action::LinkSecondary(..) => "on_link_secondary",
         Action::SecondaryPress(..) => "on_secondary_press",
@@ -124,7 +134,7 @@ pub(super) fn live_only_handler(action: &Action) -> Option<&'static str> {
         Action::DragEnd(..) => "on_drag_end",
         Action::Key { .. } => "on_key",
         Action::KeyUp(_) => "on_key_up",
-        Action::Wheel(..) => "on_wheel",
+        Action::Wheel { .. } => "on_wheel",
         Action::Gesture(_, gesture_dispatch::Gesture::Magnify(_)) => "on_magnify",
         Action::Gesture(_, gesture_dispatch::Gesture::Rotate(_)) => "on_rotate",
         Action::Gesture(_, gesture_dispatch::Gesture::SmartMagnify(..)) => "on_smart_magnify",
@@ -135,10 +145,10 @@ pub(super) fn live_only_handler(action: &Action) -> Option<&'static str> {
 #[cfg(debug_assertions)]
 pub(super) fn action_path(action: &Action) -> Option<&str> {
     match action {
-        Action::PointerMove(path, _) | Action::DrawnLayout(path, ..) | Action::Layout(path, _) | Action::Hover(path) | Action::HoverChange(path, _) | Action::SelectionChange(path, _) | Action::Press(path, _) | Action::DoublePress(path)
-        | Action::Link(path, _) | Action::LinkSecondary(path, ..) | Action::SecondaryPress(path, _) | Action::Drag(path, ..) | Action::DragRepeat(path, ..) | Action::DragStart(path)
+        Action::PointerMove(path, _) | Action::DrawnLayout(path, ..) | Action::Layout(path, _) | Action::Hover(path) | Action::HoverChange(path, _) | Action::SelectionChange(path, _) | Action::Press(path, _) | Action::DoublePress(path) | Action::MiddlePress(path)
+        | Action::Link(path, ..) | Action::LinkSecondary(path, ..) | Action::SecondaryPress(path, _) | Action::Drag(path, ..) | Action::DragRepeat(path, ..) | Action::DragStart(path)
         | Action::DragEnd(path, _) | Action::Visible(path, _) => Some(path),
-        Action::Wheel(_, chain, _) | Action::Gesture(chain, _) => chain.first().map(String::as_str),
+        Action::Wheel { chain, .. } | Action::Gesture(chain, _) => chain.first().map(String::as_str),
         _ => None,
     }
 }
@@ -155,7 +165,7 @@ fn handler_name(action: &Action) -> &'static str {
         Action::VisibleRows(..) => "on_visible_rows",
         Action::ScreenLayout(..) => "on_screen_layout",
         Action::Files(_) => "on_drop_files",
-        Action::Ime(_) => "a text input's edit",
+        Action::Ime(_) | Action::FinishIme => "a text input's edit",
         Action::Paste(..) => "on_paste",
         Action::ClipboardRead(..) => "a `read_clipboard` callback",
         Action::FileDialog(..) => "a file dialog callback",
@@ -172,7 +182,7 @@ fn stall_path(action: &Action) -> Option<&str> {
     }
 }
 
-pub(super) fn merge(tx: &mut Tx, one: Tx) {
+pub(crate) fn merge(tx: &mut Tx, one: Tx) {
     tx.pick_reads.extend(one.pick_reads);
     tx.paste |= one.paste;
     tx.clipboard_reads.extend(one.clipboard_reads);
@@ -190,6 +200,7 @@ pub(super) fn merge(tx: &mut Tx, one: Tx) {
     tx.wakes.extend(one.wakes);
     tx.text_flights.extend(one.text_flights);
     tx.launches.extend(one.launches);
+    tx.unclipped_flights |= one.unclipped_flights;
     tx.popups.extend(one.popups);
     tx.file_dialogs.extend(one.file_dialogs);
     if let Some(request) = one.window_frame { tx.window_frame = Some(tx.window_frame.unwrap_or_default().merge(request)); }
@@ -197,11 +208,12 @@ pub(super) fn merge(tx: &mut Tx, one: Tx) {
     tx.clear_secret |= one.clear_secret;
     if one.copy.is_some() { tx.copy = one.copy; }
     tx.shell = tx.shell.max(one.shell);
-    tx.minimize |= one.minimize;
+    tx.minimize_order = tx.minimize_order.max(one.minimize_order);
     tx.toggle_maximized |= one.toggle_maximized;
     tx.toggle_full_screen |= one.toggle_full_screen;
     tx.keys.extend(one.keys);
     if one.title.is_some() { tx.title = one.title; }
+    if one.announce.is_some() { tx.announce = one.announce; }
     tx.playground.extend(one.playground);
     tx.open_urls.extend(one.open_urls);
     tx.srgb_blend = one.srgb_blend.or(tx.srgb_blend);
@@ -209,17 +221,15 @@ pub(super) fn merge(tx: &mut Tx, one: Tx) {
     if one.font_families.is_some() { tx.font_families = one.font_families; }
     if one.rewind.is_some() { tx.rewind = one.rewind; }
     tx.blur |= one.blur;
+    if one.focus_to.is_some() { tx.focus_to = one.focus_to; }
     if one.select.is_some() {
         tx.select = one.select;
         tx.select_from_change = one.select_from_change;
     }
-    tx.instant |= one.instant;
-    tx.settle |= one.settle;
+    tx.commit = tx.commit.merge(one.commit);
     tx.follow_edge |= one.follow_edge;
-    if one.motion.is_some() {
-        tx.motion = one.motion;
-        tx.motion_curve = one.motion_curve;
-    }
+    tx.asked_motion |= one.asked_motion;
+    tx.motion = one.motion.or(tx.motion);
     tx.color_motion = one.color_motion.or(tx.color_motion);
 }
 
@@ -299,14 +309,14 @@ impl<S: 'static> Runtime<S> {
         let repeat = matches!(action, Action::DragRepeat(..));
         let ran = match action {
             Action::WindowFocus(focused) => {
-                if !focused { self.held = None; }
+                if !focused { self.held = physical_dispatch::Activation::Up; }
                 let Some(f) = self.nodes.get(self.app_root()).and_then(|n| n.handlers.on_window_focus.clone()) else { return false };
                 f(states!(self), focused, &mut one);
                 true
             }
             Action::Physical(event, fallback) => {
                 // The window lost key focus (an internal focus move also notifies handlers).
-                if matches!(event, crate::PhysicalInput::FocusLost) { self.held = None; }
+                if matches!(event, crate::PhysicalInput::FocusLost) { self.held = physical_dispatch::Activation::Up; }
                 let ran = self.dispatch_physical(event, fallback, tx);
                 let live_only = std::mem::take(&mut tx.live_only);
                 return if ran && live_only { self.skip_view("a key handler") } else { ran };
@@ -318,15 +328,19 @@ impl<S: 'static> Runtime<S> {
             Action::HoverFocus(path) => match path {
                 Some(path) => {
                     self.set_focus(Some(path), false);
-                    self.hover_focus = true;
-                    one.instant = true;
+                    self.focus.step(focus_machine::FocusEvent::Hover(true));
+                    one.commit = one.commit.instant();
                     true
                 }
-                None => std::mem::take(&mut self.hover_focus),
+                None => {
+                    let lit = self.focus.hovered();
+                    self.focus.step(focus_machine::FocusEvent::Hover(false));
+                    lit
+                }
             },
             Action::Dismiss(path) => {
                 let Some(f) = self.node(&path).and_then(|n| n.handlers.modal.as_ref().map(|m| m.dismiss.clone())) else { return false };
-                self.set_focus(None, self.keyboard_focus);
+                self.set_focus(None, self.focus.keyboard());
                 f(states!(self), &mut one);
                 true
             }
@@ -341,7 +355,7 @@ impl<S: 'static> Runtime<S> {
                 true
             }
             Action::FarFromBottom(path, far) => {
-                let Some((_, f)) = self.node(&path).and_then(|n| n.handlers.on_far_from_bottom.clone()) else { return false };
+                let Some((_, _, f)) = self.node(&path).and_then(|n| n.handlers.on_far_from_bottom.clone()) else { return false };
                 f(states!(self), far);
                 true
             }
@@ -401,7 +415,17 @@ impl<S: 'static> Runtime<S> {
                 f(states!(self), &mut one);
                 true
             }
-            Action::Link(path, k) => self.press_link(&path, k, &mut one),
+            Action::MiddlePress(path) => {
+                let Some(f) = self.node(&path).and_then(|n| n.handlers.on_middle_press.clone()) else { return false };
+                log_event!(self, "middle press {path}");
+                one.button = crate::PointerButton::Middle;
+                f(states!(self), &mut one);
+                true
+            }
+            Action::Link(path, k, button) => {
+                one.button = button;
+                self.press_link(&path, k, &mut one)
+            }
             Action::LinkSecondary(path, k, point) => self.secondary_press_link(&path, k, point, &mut one),
             Action::SecondaryPress(path, point) => {
                 let Some(n) = self.node(&path).filter(|n| !self.is_exiting(n.id)) else { return false };
@@ -413,7 +437,7 @@ impl<S: 'static> Runtime<S> {
             Action::Drag(path, mut d, button) | Action::DragRepeat(path, mut d, button) => {
                 let Some(f) = self.node(&path).and_then(|n| n.handlers.on_drag.clone()) else { return false };
                 if d.phase == Phase::Move {
-                    one.instant = true;
+                    one.commit = one.commit.instant();
                 }
                 one.button = button;
                 one.drag_repeat = repeat;
@@ -446,9 +470,10 @@ impl<S: 'static> Runtime<S> {
                 if stage { self.route_stage_key(&ev, &mut one) } else { self.route_key(&ev, repeat, &mut one) }
             }
             Action::KeyUp(ev) => self.route_key_up(&ev, &mut one),
-            Action::Wheel(gesture, chain, ev) => self.run_wheel(gesture, chain, ev, &mut one),
+            Action::Wheel { gesture, chain, ev, phased } => self.run_wheel(gesture, chain, ev, phased, &mut one),
             Action::Gesture(chain, gesture) => self.run_gesture(chain, gesture, &mut one),
             Action::Ime(ev) => self.run_ime(ev, &mut one),
+            Action::FinishIme => self.finish_ime(&mut one),
             Action::Paste(content, target) => {
                 if target.is_some_and(|target| target != self.paste_target()) { return false; }
                 let hook = self.focused_input().and_then(|i| i.paste.clone());
@@ -491,9 +516,10 @@ impl<S: 'static> Runtime<S> {
             }
             Action::FileDialog(id, result) => self.run_file_dialog(id, result, &mut one),
             Action::Focus(path, x, y) => self.focus_input(path, x, y, &mut one),
+            Action::FieldMenu(path, at, local) => self.field_menu(path, at, local, &mut one),
             Action::Blur => {
-                if self.focused.is_none() { return false; }
-                self.set_focus(None, self.keyboard_focus);
+                if self.focus.path().is_none() { return false; }
+                self.set_focus(None, self.focus.keyboard());
                 true
             }
             Action::A11y(path, act) => self.run_a11y(path, act, &mut one),
@@ -501,10 +527,8 @@ impl<S: 'static> Runtime<S> {
         let live_only = std::mem::take(&mut one.live_only);
         if live_only && live_label.is_some() {
             // A handler that asks for no commit cannot change another handler's animation.
-            one.instant = false;
-            one.settle = false;
+            one.commit = Commit::Animate;
             one.motion = None;
-            one.motion_curve = None;
             one.follow_edge = false;
             one.color_motion = None;
         }

@@ -1,7 +1,8 @@
 //! Measuring text from a view, for views that place things themselves (table columns, diagram
-//! nodes). A view has no handle on the runtime's text system, so each thread keeps one of its own
-//! built from the fonts the most recent [`TextSystem`] was given: the app's `AppSpec::fonts` in
-//! an app, the built-in Inter in a test runtime. Same shaper, same fonts, same numbers.
+//! nodes). While a window's view runs, its measures use the window's own text system (`lend`).
+//! Elsewhere (a handler, another thread) each thread keeps one of its own, built from the fonts the
+//! most recent [`TextSystem`] was given: the app's `AppSpec::fonts` in an app, the built-in Inter
+//! in a test runtime. Same shaper, same fonts, same numbers.
 
 use std::cell::RefCell;
 use std::marker::PhantomData;
@@ -42,6 +43,21 @@ thread_local! {
     static MEASURER: RefCell<Option<Measurer>> = const { RefCell::new(None) };
     /// This thread's [`with_families`] state: a private copy of `FONTS` that notes land in.
     static OVERRIDE: RefCell<Option<Fonts>> = const { RefCell::new(None) };
+    /// The text system of the window whose view is running on this thread (`lend`), if any.
+    static LENT: std::cell::Cell<*mut TextSystem> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+/// Runs `f` (a window's view) with [`measure`] and the rest using `text`, the window's own text
+/// system, rather than this thread's copy. The copy loads every font and fallback again (a title
+/// with one Arabic or emoji character costs 6-30 ms its first time), and its shapes aren't the ones
+/// the window lays out. `text` mustn't be used another way until `f` returns.
+pub(crate) fn lend<R>(text: &mut TextSystem, f: impl FnOnce() -> R) -> R {
+    struct Restore(*mut TextSystem);
+    impl Drop for Restore {
+        fn drop(&mut self) { LENT.with(|l| l.set(self.0)); }
+    }
+    let _restore = Restore(LENT.with(|l| l.replace(text)));
+    f()
 }
 
 /// Runs `f` on the state this thread measures with: its override when a [`with_families`]
@@ -77,6 +93,18 @@ fn apply_fonts(slot: &mut Option<Fonts>, fonts: &[&'static [u8]], families: (&st
 /// Called by every [`TextSystem::new`]; the next measurement uses these fonts.
 pub(super) fn note_fonts(fonts: &[&'static [u8]], families: (&str, &str)) {
     with_state(|slot| apply_fonts(slot, fonts, families));
+}
+
+/// Called when faces a web app adds after its first frame arrive: the next measurement shapes
+/// with them.
+#[cfg(target_arch = "wasm32")]
+pub(super) fn note_faces_arrived() {
+    with_state(|slot| {
+        if let Some(f) = slot.as_mut() {
+            f.generation += 1;
+            f.fonts_generation = f.generation;
+        }
+    });
 }
 
 /// Called by [`TextSystem::set_families`]; the next measurement uses these families.
@@ -162,7 +190,8 @@ pub fn with_families(sans: &str, mono: &str) -> FamiliesGuard {
 
 /// The size in points of `text` (with `spans`, as [`crate::rich`] takes them) set in `style`,
 /// wrapped at `max_width` points when given, as the runtime will lay it out. Widths round up
-/// to whole points. `max_width: Some(0.0)` gives the widest unbreakable run (CSS min-content).
+/// to whole points; heights are the lines' own, as a text lays out unless it asks for
+/// [`El::rounded_lines`](crate::El::rounded_lines). `max_width: Some(0.0)` gives the widest unbreakable run (CSS min-content).
 ///
 /// The first call on a thread loads the fonts (a few milliseconds); later calls cost a hash
 /// lookup when the same text was measured recently, or one shaping pass when not.
@@ -184,7 +213,18 @@ pub fn measure_with(
         let l = t.layout_rich_with(text, spans, style, 1.0, max_width, options);
         // Spaces hanging past a wrapped line's end take no room, as the runtime measures them.
         let w = if max_width.is_some() { l.width() } else { l.full_width() };
-        (w.ceil(), super::layout_height(&l, style, 1.0))
+        (w.ceil(), super::line_metrics::spec_height(&l, style, 1.0, true))
+    })
+}
+
+/// CSS's min-content and max-content widths of `text` (with `spans`) in `style`, in points and
+/// unrounded, as a browser's automatic table layout reads a cell: its widest unbreakable run,
+/// and its width on one line, neither counting the spaces that end a line.
+pub fn content_widths(text: &str, spans: &[Span], style: TextStyle) -> (f32, f32) {
+    with_text(|t| {
+        let min = t.layout_rich_with(text, spans, style, 1.0, Some(0.0), RichLayoutOptions::default()).width();
+        let max = t.layout_rich_with(text, spans, style, 1.0, None, RichLayoutOptions::default()).width();
+        (min, max)
     })
 }
 
@@ -194,8 +234,33 @@ pub fn advance(text: &str, style: TextStyle) -> f32 {
     with_text(|t| t.layout_rich(text, &[], style, 1.0, None).full_width())
 }
 
+/// Where each line of `text` starts (byte offsets), set in the sans family at `size` points and
+/// `weight` and wrapped at `width` points, as the runtime lays it out: for a page's harness to
+/// compare with the browser's own lines (`platform/web.rs`, `__runeLines`).
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn line_starts(text: &str, size: f32, weight: f32, width: f32) -> Vec<usize> {
+    with_text(|t| {
+        let l = t.layout_rich_with(text, &[], TextStyle::new(size, weight), 1.0, Some(width), RichLayoutOptions::default());
+        l.lines().map(|line| line.text_range().start).collect()
+    })
+}
+
 /// Runs `f` on this thread's text system, built from the fonts the app was given.
 pub(super) fn with_text<R>(f: impl FnOnce(&mut TextSystem) -> R) -> R {
+    // A view's measures use its window's text system, unless a `with_families` guard asks for
+    // other families. Taken while in use, so a measure inside `f` can't alias it.
+    let lent = LENT.with(|l| l.replace(std::ptr::null_mut()));
+    if !lent.is_null() && OVERRIDE.with_borrow(Option::is_none) {
+        struct Restore(*mut TextSystem);
+        impl Drop for Restore {
+            fn drop(&mut self) { LENT.with(|l| l.set(self.0)); }
+        }
+        let _restore = Restore(lent);
+        // SAFETY: `lend` set it from a live `&mut TextSystem` that nothing else uses until
+        // `lend` returns, and it's taken out of `LENT` while this borrow lives.
+        return f(unsafe { &mut *lent });
+    }
+    LENT.with(|l| l.set(lent));
     MEASURER.with_borrow_mut(|m| {
         let current = font_epoch();
         if m.as_ref().is_none_or(|m| m.generation != current) {

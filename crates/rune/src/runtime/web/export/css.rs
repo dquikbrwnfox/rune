@@ -147,19 +147,23 @@ pub(super) fn paint(v: &Visual, size: (f32, f32), d: &mut Decls) {
     if v.fill.a > 0.0 { layers.push(color(v.fill)); }
     if !layers.is_empty() { d.push(("background", layers.join(","))); }
     if let Some(clip) = v.cold.clip { mask(clip, d); }
-    let r = v.radius;
+    let r = v.radii();
     if r.iter().any(|&c| c > 0.0) {
         let value = if r.iter().all(|&c| c == r[0]) { px(r[0]) } else { r.map(px).join(" ") };
         d.push(("border-radius", value));
     }
     let laid_out_border = d.iter().any(|(p, _)| *p == "border-width");
     let mut shadows: Vec<String> = Vec::new();
-    if v.border_width > 0.0 && v.border.a > 0.0 {
+    if v.border_width() > 0.0 && v.border().a > 0.0 {
         if laid_out_border {
             d.push(("border-style", "solid".into()));
-            d.push(("border-color", color(v.border)));
+            d.push(("border-color", color(v.border())));
+        } else if let Some([t, r, b, l]) = v.cold.border_sides {
+            for (x, y, w) in [(0.0, t, t), (-r, 0.0, r), (0.0, -b, b), (l, 0.0, l)] {
+                if w > 0.0 { shadows.push(format!("inset {} {} 0 0 {}", px(x), px(y), color(v.border()))); }
+            }
         } else {
-            shadows.push(format!("inset 0 0 0 {} {}", px(v.border_width), color(v.border)));
+            shadows.push(format!("inset 0 0 0 {} {}", px(v.border_width()), color(v.border())));
         }
     }
     for s in &v.cold.shadows {
@@ -167,7 +171,8 @@ pub(super) fn paint(v: &Visual, size: (f32, f32), d: &mut Decls) {
         shadows.push(format!("{inset}{} {} {} {} {}", px(s.x), px(s.y), px(s.blur), px(s.spread), color(s.color)));
     }
     if !shadows.is_empty() { d.push(("box-shadow", shadows.join(","))); }
-    if v.opacity < 0.999 { d.push(("opacity", num(v.opacity))); }
+    let opacity = v.opacity * v.layer_opacity;
+    if opacity < 0.999 { d.push(("opacity", num(opacity))); }
     if v.cold.clip.is_some() || v.cold.clip_radius.is_some() {
         if !d.iter().any(|(p, _)| p.starts_with("overflow")) { d.push(("overflow", "hidden".into())); }
     }
@@ -248,6 +253,7 @@ pub(super) fn text(spec: &TextSpec, d: &mut Decls) {
     } else {
         d.push(("white-space", if spec.wrap { "pre-wrap" } else { "pre" }.into()));
         if spec.wrap_anywhere { d.push(("overflow-wrap", "anywhere".into())); }
+        if spec.pretty() { d.push(("text-wrap-style", "pretty".into())); }
     }
 }
 
@@ -256,7 +262,7 @@ pub(super) fn text_html(spec: &TextSpec) -> String {
     let content = &spec.content;
     let mut cuts: Vec<usize> = vec![0, content.len()];
     for s in &spec.spans { cuts.extend([s.start as usize, s.end as usize]); }
-    for l in &spec.links { cuts.extend([l.start as usize, l.end as usize]); }
+    for l in &spec.cold.links { cuts.extend([l.start as usize, l.end as usize]); }
     cuts.retain(|&c| c <= content.len() && content.is_char_boundary(c));
     cuts.sort_unstable();
     cuts.dedup();
@@ -264,10 +270,10 @@ pub(super) fn text_html(spec: &TextSpec) -> String {
     let mut open_link: Option<usize> = None;
     for w in cuts.windows(2) {
         let (a, b) = (w[0], w[1]);
-        let link = spec.links.iter().position(|l| (l.start as usize) <= a && b <= l.end as usize);
+        let link = spec.cold.links.iter().position(|l| (l.start as usize) <= a && b <= l.end as usize);
         if link != open_link {
             if open_link.is_some() { out.push_str("</a>"); }
-            if let Some(k) = link { let _ = write!(out, "<a href=\"{}\">", escape(&spec.links[k].id)); }
+            if let Some(k) = link { let _ = write!(out, "<a href=\"{}\">", escape(&spec.cold.links[k].id)); }
             open_link = link;
         }
         let piece = escape(&content[a..b]);

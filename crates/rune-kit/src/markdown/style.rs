@@ -26,6 +26,8 @@ pub struct MarkdownStyle {
     pub(super) code_block: TextStyle,
     /// Code blocks' text where the highlighter leaves it (the body text colour by default).
     pub(super) code_text: Option<Color>,
+    /// Code blocks no highlighter colours (no language, or one it doesn't know): code_text by default.
+    pub(super) plain_code_text: Option<Color>,
     /// Shell fences' own look (see [`MarkdownStyle::shell_code`]).
     pub(super) shell: Option<ShellLook>,
     pub(super) link_hover: Option<Color>,
@@ -60,6 +62,16 @@ pub struct MarkdownStyle {
     pub(super) table_full_width: bool,
     /// Space above and below a table (collapsed with its neighbours' like CSS margins).
     pub(super) table_margin: [f32; 2],
+    /// Space above and below a code block, a diff and a diagram (collapsed like `table_margin`).
+    pub(super) code_margin: [f32; 2],
+    /// A wide table's scroll bar thumb, at rest and under the pointer (`None`: no bar).
+    pub(super) table_bar: Option<[Color; 2]>,
+    /// The text column's width, when the app knows it (see [`MarkdownStyle::text_width`]).
+    pub(super) text_width: Option<f32>,
+    /// How far a wide code block's sides fade while it scrolls sideways.
+    pub(super) wide_fade: f32,
+    /// The icon before a link to a web page: its size and gap (`None`: no icon).
+    pub(super) link_icon: Option<[f32; 2]>,
     pub(super) diff_add: Color,
     pub(super) diff_remove: Color,
     pub(super) diff_add_text: Color,
@@ -171,6 +183,7 @@ impl MarkdownStyle {
             headings: [heading(17.0, 24.0), heading(15.0, 24.0), heading(13.0, 20.0), heading(13.0, 20.0)],
             code_block: TextStyle { size: 13.0, line_height: 20.0, ..k.ty.mono },
             code_text: None,
+            plain_code_text: None,
             shell: None,
             link_hover: None,
             list_outside: false,
@@ -199,6 +212,11 @@ impl MarkdownStyle {
             table_head_pad: None,
             table_full_width: false,
             table_margin: [12.0, 16.0],
+            code_margin: [12.0, 24.0],
+            table_bar: None,
+            text_width: None,
+            wide_fade: 12.0,
+            link_icon: None,
             diff_add: tint(c.layer_01, c.success.icon, if k.dark { 0.11 } else { 0.14 }),
             diff_remove: tint(c.layer_01, c.danger.icon, if k.dark { 0.11 } else { 0.14 }),
             diff_add_text: c.text_base,
@@ -316,6 +334,12 @@ impl MarkdownStyle {
         self.code_text = Some(c);
         self
     }
+    /// The text of plain-text code blocks: a fence with no language, or `text`, `txt`, `plain`
+    /// or `plaintext` (`code_block_text`'s colour by default).
+    pub fn plain_code_text(mut self, c: Color) -> Self {
+        self.plain_code_text = Some(c);
+        self
+    }
     /// Fences in a shell language (`bash`, `sh`, `shell`, `zsh`, `fish`, `console`,
     /// `terminal`) on `fill` with a `border`, their text all in `text` with no syntax colours,
     /// as a web page that styles a command apart from code.
@@ -387,6 +411,28 @@ impl MarkdownStyle {
     }
     pub fn strong_weight(mut self, w: f32) -> Self {
         self.strong_weight = w;
+        self
+    }
+    /// The width of the column the document lays out in, when the app knows it. With
+    /// [`Markdown::scroll_wide`], tables then size their columns as a browser's automatic table
+    /// layout does: in proportion to their content when it fits, between their narrowest and
+    /// widest when it nearly does, and at their narrowest (each column's longest word), scrolling
+    /// sideways, when even that is wider than the text. Lists and quotes take their indent off it.
+    pub fn text_width(mut self, points: f32) -> Self {
+        self.text_width = (points.is_finite() && points > 0.0).then_some(points);
+        self
+    }
+    /// How far the sides of a code block that scrolls sideways ([`Markdown::scroll_wide`]) fade
+    /// out, in points: 12 by default, 0 for a hard edge as a web page's `overflow: auto` clips.
+    pub fn wide_fade(mut self, points: f32) -> Self {
+        self.wide_fade = if points.is_finite() { points.max(0.0) } else { 0.0 };
+        self
+    }
+    /// The space above and below a code block, a diff and a diagram (12 and 24 points by
+    /// default). Like the other blocks' margins, it collapses with the space a neighbour wants,
+    /// taking the larger.
+    pub fn code_margin(mut self, top: f32, bottom: f32) -> Self {
+        self.code_margin = [super::table::pts(top), super::table::pts(bottom)];
         self
     }
     /// The tints behind a diff's added and removed lines (full width).
@@ -540,6 +586,7 @@ impl std::hash::Hash for MarkdownStyle {
             headings,
             code_block,
             code_text,
+            plain_code_text,
             shell,
             link_hover,
             list_outside,
@@ -568,6 +615,11 @@ impl std::hash::Hash for MarkdownStyle {
             table_head_pad,
             table_full_width,
             table_margin,
+            code_margin,
+            table_bar,
+            text_width,
+            wide_fade,
+            link_icon,
             diff_add,
             diff_remove,
             diff_add_text,
@@ -587,14 +639,15 @@ impl std::hash::Hash for MarkdownStyle {
             diagram,
         } = *self;
         (text, muted, accent, link_underline, code_bg, code_block_fill, code_block_border, quote_rule, rule).hash(state);
-        (body, headings, code_block, code_text, shell, link_hover, list_outside, list_nested.map(|n| n.map(f32_bits)), table_align).hash(state);
+        (body, headings, code_block, (code_text, plain_code_text), shell, link_hover, list_outside, list_nested.map(|n| n.map(f32_bits)), table_align).hash(state);
         (f32_bits(quote.width), f32_bits(quote.pad), quote.text).hash(state);
         [inline_code_scale, inline_code_weight, inline_code_pad, code_block_pad[0], code_block_pad[1], list_indent, list_gap, strong_weight, table_min_column]
             .map(f32_bits)
             .hash(state);
         (table_outline, table_rule, table_head_fill, table_head_text, table_head_rule, table_head_weight.map(f32_bits), table_tabular, table_font).hash(state);
-        ([f32_bits(table_pad[0]), f32_bits(table_pad[1])], table_flush_left, table_head_pad.map(|p| p.map(f32_bits)), table_full_width, table_margin.map(f32_bits)).hash(state);
+        ([f32_bits(table_pad[0]), f32_bits(table_pad[1])], table_flush_left, table_head_pad.map(|p| p.map(f32_bits)), table_full_width, table_margin.map(f32_bits), code_margin.map(f32_bits)).hash(state);
         table_frame.map(|TableFrame { fill, ring, pad }| (fill, ring, f32_bits(pad))).hash(state);
+        (table_bar, text_width.map(f32_bits), f32_bits(wide_fade), link_icon.map(|l| l.map(f32_bits))).hash(state);
         match table_body {
             None => 0u8.hash(state),
             Some(TableBody { fill, radius, shadows }) => {

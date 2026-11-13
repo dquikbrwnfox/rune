@@ -2,6 +2,7 @@
 //! `Tx::scroll_to_y`: moving a viewport to an offset its app picked, gliding there or at once;
 //! and `Tx::scroll_key_to`, landing an element at a height in its viewport.
 use super::*;
+use crate::runtime::scroll_mode::{self as mode, Event as ModeEvent};
 
 /// A request to move a viewport to an offset on one axis or both.
 #[derive(Clone, Debug)]
@@ -33,11 +34,7 @@ impl<S: 'static> Runtime<S> {
                 let Some((i, to)) = self.anchor_offset(&r.key, r.y.unwrap_or(0.0)) else { continue };
                 jumps.push((self.nodes[i].id, false, to));
                 anchors.push((jumps.len() - 1, r.key, r.y.unwrap_or(0.0)));
-                if let Some(st) = self.scrolls.get_mut(&self.nodes[i].id) {
-                    st.v = 0.0;
-                    st.glide = None;
-                    st.glide_to = None;
-                }
+                if let Some(st) = self.scrolls.get_mut(&self.nodes[i].id) { st.halt(); }
                 continue;
             }
             let Some(i) = self.scroll_viewport_on(&r.key, r.x.is_some(), r.y.is_some()) else { continue };
@@ -63,18 +60,14 @@ impl<S: 'static> Runtime<S> {
             }
             if let Some(y) = r.y.filter(|_| axes.y()) {
                 let to = f64::from(y).max(0.0);
-                st.v = 0.0;
                 if let Some(spring) = glide && (to.min(st.max) - st.offset).abs() > 0.5 {
                     let reach = scroll_bottom::GLIDE_REACH * view_h;
                     let end = to.min(st.max);
                     st.offset = st.offset.clamp(end - reach, end + reach);
-                    st.glide_to = Some(to);
-                    st.glide = Some(retarget_v(spring, st.offset, st.glide.unwrap_or(0.0), end));
-                    st.shrink_glide = false;
-                    st.pinned = false;
+                    let v = retarget_v(spring, st.offset, st.glide().unwrap_or(0.0), end);
+                    st.mode = st.mode.to_glide(v, GlideTo::Offset(to));
                 } else {
-                    st.glide = None;
-                    st.glide_to = None;
+                    st.halt();
                     jumps.push((id, false, to));
                 }
             }
@@ -93,18 +86,25 @@ impl<S: 'static> Runtime<S> {
     }
 
     fn apply_jumps(&mut self, jumps: &[(NodeId, bool, f64)]) {
+        let now = self.clock;
         for &(id, horizontal, to) in jumps {
             let stick = self.nodes.iter().find(|n| n.id == id).and_then(|n| n.scroll).is_some_and(|s| s.stick_bottom);
             let Some(st) = self.scrolls.get_mut(&id) else { continue };
-            st.direct = true;
+            st.moved();
             let was = if horizontal { st.x.offset } else { st.offset };
             if horizontal {
                 st.x.offset = to.min(st.x.max);
             } else {
                 st.offset = to.min(st.max);
-                st.pinned = stick && st.offset >= st.max - 0.5;
+                // The jump halted the old motion when queued. Don't cancel a later
+                // request in the same transaction to glide from the new offset.
+                if st.glide().is_none() { st.land(stick); }
             }
-            if (if horizontal { st.x.offset } else { st.offset } - was).abs() > 1e-3 { st.nudged = NUDGE_FRAMES; }
+            if (if horizontal { st.x.offset } else { st.offset } - was).abs() > 1e-3 {
+                // The arm's due is taken back from the state each frame (`step_nudges`), so a
+                // later arm in the same frame wins and nothing here has to keep it.
+                let _ = st.nudge.arm(now);
+            }
         }
     }
 
@@ -149,26 +149,20 @@ impl<S: 'static> Runtime<S> {
         let stack = self.stacks.get(&self.nodes[c].id)?;
         let moving = stack.moving || !stack.closing.is_empty();
         let path = &self.nodes[i].path;
-        let owned = self.keeps.iter().any(|k| k.viewport == *path) || self.scroll_reveals.iter().any(|r| r.viewport == *path);
+        let owned = self.requests.owns(path);
         let bottom = self.scroll_children(i).map(|k| self.nodes[k].target[3]).reduce(f32::max).unwrap_or(self.nodes[c].target[3]);
         let end = f64::from(bottom - self.nodes[i].target[3]).max(0.0);
         let held = self.reduced_motion || owned;
         let st = self.scrolls.get_mut(&self.nodes[i].id)?;
-        if st.glide.is_none() { st.shrink_glide = false; }
-        st.shrink_cut = moving && (st.shrink_cut || st.direct || st.v.abs() > 1.0);
-        if st.shrink_glide {
-            if held || st.shrink_cut || end >= st.offset {
-                st.glide = None;
-                st.glide_to = None;
-                st.shrink_glide = false;
-            } else {
-                st.glide_to = Some(end);
+        let _ = mode::step(&mut st.mode, ModeEvent::Growth { moving });
+        match st.mode {
+            ScrollMode::Glide { to: GlideTo::ShrunkEnd(_), .. } if held || st.shrink_cut() || end >= st.offset => st.mode = st.mode.to_rest(),
+            ScrollMode::Glide { v, to: GlideTo::ShrunkEnd(_), .. } => st.mode = st.mode.to_glide(v, GlideTo::ShrunkEnd(end)),
+            ScrollMode::Rest(_) | ScrollMode::Momentum { .. } if moving && !(held || st.shrink_cut() || st.offset > overflow || st.offset - end <= 0.5) => {
+                st.mode = st.mode.to_glide(0.0, GlideTo::ShrunkEnd(end));
+                st.spring = None;
             }
-        } else if moving && !(held || st.shrink_cut || st.pinned || st.glide.is_some() || st.offset > overflow || st.offset - end <= 0.5) {
-            st.glide = Some(0.0);
-            st.glide_to = Some(end);
-            st.spring = None;
-            st.shrink_glide = true;
+            _ => {}
         }
         moving.then_some(end)
     }
@@ -204,11 +198,6 @@ pub(super) fn glide_axis(spring: Spring, offset: &mut f64, glide: &mut Option<f3
     true
 }
 
-/// Frames an app's instant scroll holds hover for: the frame it lands and the next, so an app
-/// stepping its own glide each frame holds hover throughout, and hover resolves once at the
-/// pointer the frame after its last step.
-const NUDGE_FRAMES: u8 = 2;
-
 impl ScrollState {
     /// The spring the running glide steps on.
     pub(super) fn glide_spring(&self) -> Spring {
@@ -218,19 +207,76 @@ impl ScrollState {
     /// A hand, its momentum or a glide is moving the content this frame: what
     /// [`ElementInfo::scrolling`](crate::ElementInfo) reports for everything inside.
     pub(crate) fn moving(&self) -> bool {
-        self.scrolling || self.glide.is_some() || self.x.glide.is_some()
+        self.scrolling() || self.glide().is_some() || self.x.glide.is_some()
     }
+
+    /// It follows its content's bottom.
+    pub(super) fn pinned(&self) -> bool { self.mode.pinned() }
+
+    /// The running glide's speed (points a second), while one runs.
+    pub(super) fn glide(&self) -> Option<f32> { self.mode.glide() }
+
+    /// Where the running glide heads, when that isn't the bottom.
+    #[cfg(test)]
+    pub(super) fn glide_to(&self) -> Option<f64> {
+        match self.mode {
+            ScrollMode::Glide { to, .. } => to.offset(),
+            _ => None,
+        }
+    }
+
+    /// Its momentum (points a second), 0 unless coasting.
+    pub(super) fn coast(&self) -> f32 { self.mode.coast() }
+
+    /// A hand or its momentum moved it in the last step.
+    pub(super) fn scrolling(&self) -> bool { self.mode.hand().scrolling }
+
+    /// A hand or an app moved it since the last step.
+    pub(super) fn direct(&self) -> bool { self.mode.hand().direct }
+
+    /// A hand scrolled while the growth stack moved.
+    pub(super) fn shrink_cut(&self) -> bool { self.mode.hand().shrink_cut }
+
+    /// The growth stack's layout end while its rows still move.
+    pub(super) fn laid(&self) -> Option<f64> { self.mode.hand().laid }
+
+    /// A hand or an app put the offset where it is.
+    pub(super) fn moved(&mut self) { let _ = mode::step(&mut self.mode, mode::Event::Moved); }
+
+    /// The viewport was concealed: nothing moved it, whatever a hand did before.
+    pub(super) fn still(&mut self) { let _ = mode::step(&mut self.mode, mode::Event::Still); }
+
+    /// Follow the bottom from here (a pinned viewport keeps how its end last stepped).
+    pub(super) fn pin(&mut self) { let _ = mode::step(&mut self.mode, mode::Event::Pin); }
+
+    /// Stop following the bottom, where it stands.
+    pub(super) fn unpin(&mut self) { let _ = mode::step(&mut self.mode, mode::Event::Unpin); }
+
+    /// Momentum and any glide stop; a pinned viewport stays pinned.
+    pub(super) fn halt(&mut self) { let _ = mode::step(&mut self.mode, mode::Event::Halt); }
+
+    /// A hand or an app put the offset where it is: momentum and any glide stop, and a
+    /// stick-to-bottom viewport (`stick`) follows its end only if it sits there.
+    pub(super) fn land(&mut self, stick: bool) {
+        if stick && self.offset >= self.max - 0.5 { self.pin() } else { let _ = mode::step(&mut self.mode, mode::Event::Rest); }
+    }
+
+    /// An app's instant scroll landed less than `scroll_nudge::NUDGE_HOLD` ago: content moved
+    /// under a still pointer, so hover waits as it does for a glide it stepped itself.
+    pub(super) fn hold_at(&self, now: f64) -> bool { self.nudge.hold_at(now) }
 }
 
 impl<S: 'static> Runtime<S> {
-    /// Counts down, once a frame, the frames an app's instant scrolls hold hover for. Returns
-    /// whether one still holds, which asks for the frame that lets go.
-    pub(super) fn step_nudges(&mut self) -> bool {
-        let mut held = false;
+    /// Steps the holds an app's instant scrolls armed, and returns the earliest due one still
+    /// pending: the frame that carries it resolves hover at the pointer. A held nudge asks for
+    /// no frame itself, so the frame's end wakes for that one, however often the app re-armed it.
+    pub(super) fn step_nudges(&mut self) -> Option<f64> {
+        let now = self.clock;
+        let mut due: Option<f64> = None;
         for st in self.scrolls.values_mut() {
-            st.nudged = st.nudged.saturating_sub(1);
-            held |= st.nudged > 0;
+            st.nudge.tick(now);
+            if let Some(at) = st.nudge.due() { due = Some(due.map_or(at, |d: f64| d.min(at))); }
         }
-        held
+        due
     }
 }

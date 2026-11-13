@@ -50,25 +50,30 @@ use rune::{Align, Color, Cursor, El, Family, Link, LinkPaint, Span, TextHighligh
 use crate::Kit;
 
 mod autolink;
+mod bidi;
 mod cache;
 mod find;
 mod highlight;
+mod image;
 mod interrupt;
+mod link_icon;
 mod links;
 mod parser;
+mod plain;
 mod render;
 mod stream;
 mod style;
 mod table;
 
 pub use find::{Case, find};
+pub use image::ImageFrame;
 pub use style::MarkdownStyle;
 #[cfg(feature = "mermaid")] pub(crate) use style::DiagramPaint;
 
 use crate::budget::Budget;
 use crate::syntax::{Highlighter, SyntaxTheme};
 pub use crate::syntax::Syntax;
-use links::{LinkHelp, LinkLook, LinkRing, LinkWire};
+use links::{CodeLink, LinkHelp, LinkLook, LinkRing, LinkWire};
 pub use cache::parse_cached;
 pub use highlight::{Highlight, HighlightItem};
 pub use parser::parse;
@@ -77,7 +82,7 @@ use autolink::autolink_inline;
 use cache::{doc_cached, stream_cached};
 #[cfg(test)]
 use cache::{CACHE, PARSES};
-use parser::{BlockMap, Cut, PAD, ParsedDoc, Source, SpanMap, parse_doc};
+use parser::{BlockMap, CLOSE, Cut, PAD, ParsedDoc, Source, SpanMap, parse_doc, unpadded};
 use render::{Renderer, hash_of, rendered_keys, source_copy};
 use stream::parse_streaming;
 
@@ -118,6 +123,10 @@ pub enum Block {
     Diff(String),
     /// A ```` ```mermaid ```` fence, closed or still arriving.
     Mermaid(String),
+    /// An image (`![alt](src "title")`) that stands as a block of its own, as `markdown.css`'s
+    /// `img { display: block }` sets one: a paragraph around it splits into the text before
+    /// and after it. An image inside a link or emphasis stays its alt text in the line.
+    Image { src: String, alt: String, title: String },
 }
 
 /// A GFM table. Rows may have fewer cells than there are columns.
@@ -135,6 +144,15 @@ type TaskWire = Rc<dyn Fn(El, Rc<str>, usize, bool) -> El>;
 #[cfg(feature = "mermaid")]
 type FrameWire = Rc<dyn Fn(El, &DiagramFrame<'_>) -> El>;
 type CodeWire = Rc<dyn Fn(El, &CodeFrame<'_>) -> El>;
+type QuoteWire = Rc<dyn Fn(El, &QuoteFrame<'_>) -> El>;
+
+/// A block quote [`Markdown::quote_frame`] is wrapping.
+#[non_exhaustive]
+pub struct QuoteFrame<'a> {
+    /// What it says, as copying a selection of all of it gives it: a blank line between
+    /// paragraphs, list items after their markers, no quote marks.
+    pub text: &'a str,
+}
 
 /// A code block [`Markdown::code_frame`] is wrapping.
 #[non_exhaustive]
@@ -180,13 +198,19 @@ pub struct Markdown {
     on_task: Option<TaskWire>,
     tasks_read_only: bool,
     link_ring: Option<LinkRing>,
+    code_link: Option<CodeLink>,
     selectable: bool,
     copy_source: bool,
     scroll_wide: bool,
+    tentative: Option<rune::Direction>,
     highlighter: Highlighter,
     #[cfg(feature = "mermaid")]
     diagram_frame: Option<FrameWire>,
     code_frame: Option<CodeWire>,
+    quote_frame: Option<QuoteWire>,
+    link_favicon: Option<link_icon::FaviconWire>,
+    images: Option<image::ImageWire>,
+    on_image: Option<image::ImagePress>,
 }
 
 #[cfg(test)]
@@ -196,10 +220,10 @@ thread_local! {
 
 impl Markdown {
     pub fn new(src: impl Into<String>) -> Markdown {
-        Markdown { src: src.into(), style: None, block_keys: Vec::new(), highlights: Vec::new(), autolink: true, reveal: -1.0, streaming: false, on_link: None, on_link_secondary: None, link_look: None, link_help: None, link_ring: None,
-            on_task: None, tasks_read_only: false, selectable: false, copy_source: false, scroll_wide: false, highlighter: Highlighter::builtin(),
+        Markdown { src: src.into(), style: None, block_keys: Vec::new(), highlights: Vec::new(), autolink: true, reveal: -1.0, streaming: false, on_link: None, on_link_secondary: None, link_look: None, link_help: None, link_ring: None, code_link: None,
+            on_task: None, tasks_read_only: false, selectable: false, copy_source: false, scroll_wide: false, tentative: None, highlighter: Highlighter::builtin(),
             #[cfg(feature = "mermaid")]
-            diagram_frame: None, code_frame: None }
+            diagram_frame: None, code_frame: None, quote_frame: None, link_favicon: None, images: None, on_image: None }
     }
     /// Highlight UTF-8 byte ranges of the Markdown source string (see [`find`]).
     ///
@@ -298,8 +322,10 @@ impl Markdown {
     /// Lets people select and copy the text (see [`El::selectable`]) as one selection across
     /// paragraphs, headings, list items, quotes, code blocks and table cells
     /// ([`El::selection_group`]): Cmd+A selects the whole block, and Cmd+C copies the text as
-    /// drawn, a newline between blocks and a tab between table cells, without list markers or
-    /// code fences (or the source, with [`Self::copy_source`]). Links still open on a click.
+    /// drawn, laid out as plain text: a blank line around paragraphs, headings, quotes and code
+    /// blocks, list items on their own lines after `- `, `1. ` or `- [ ] ` (a nested list indented
+    /// past its parent's marker), and a tab between table cells, without code fences or quote marks (or the
+    /// source, with [`Self::copy_source`]). Links still open on a click.
     /// The highlight is [`MarkdownStyle::selection`].
     pub fn selectable(mut self, on: bool) -> Self {
         self.selectable = on;
@@ -317,6 +343,15 @@ impl Markdown {
         self
     }
 
+    /// The direction the document reads in until its first strong character arrives (and a block
+    /// with none in it, before any block has one): a reply's, the direction of the prompt it
+    /// answers. Each block then reads the way its own words do, a block with none the way the
+    /// block before it does. Code and diffs read left to right always. Without it that's the
+    /// direction around the document.
+    pub fn dir_tentative(mut self, dir: rune::Direction) -> Self {
+        self.tentative = Some(dir);
+        self
+    }
     /// Code blocks keep their lines whole and tables their columns' natural widths, each
     /// scrolling sideways in its own [`El::scroll_x`] viewport when wider than the text column,
     /// with soft left and right edges on code. Off (the default), code wraps and columns shrink.
@@ -350,7 +385,18 @@ impl Markdown {
         self
     }
 
-    /// Colours code blocks with `f` instead of the built-in scanners: it gets a fence's language
+    /// Draws `f(quote, frame)` in place of each block quote, so an app can put its own controls
+    /// on it (a button that copies the whole quote). Quotes inside a quote come here too.
+    ///
+    /// ```ignore
+    /// Markdown::new(src).quote_frame(|quote, q| col().child(quote).child(copy_button(q.text)))
+    /// ```
+    pub fn quote_frame(mut self, f: impl Fn(El, &QuoteFrame<'_>) -> El + 'static) -> Self {
+        self.quote_frame = Some(Rc::new(f));
+        self
+    }
+
+    /// Colours code blocks with `f` instead of the built-in highlighter: it gets a fence's language
     /// as written (its info string's first word; `None` for an indented block or a bare fence)
     /// and the code, and returns byte ranges of the code with a token kind, which the style's
     /// [`SyntaxTheme`] colours, or a colour of its own. See [`Highlighter`] for caching, and
@@ -358,7 +404,7 @@ impl Markdown {
     ///
     /// ```ignore
     /// Markdown::new(src).highlight(|lang, code| match lang {
-    ///     Some("kotlin") => my_kotlin(code),
+    ///     Some("cobol") => my_cobol(code),
     ///     _ => rune_kit::syntax::builtin(lang, code),
     /// })
     /// ```
@@ -385,10 +431,15 @@ impl Markdown {
             && self.link_look.is_none()
             && self.link_help.is_none()
             && self.link_ring.is_none()
+            && self.code_link.is_none()
             && self.on_task.is_none()
             && !(self.selectable && self.copy_source)
             && self.highlighter.is_builtin()
             && self.code_frame.is_none()
+            && self.quote_frame.is_none()
+            && self.link_favicon.is_none()
+            && self.images.is_none()
+            && self.on_image.is_none()
             && !(cfg!(feature = "mermaid") && self.src.contains("mermaid"));
         if can_cache {
             let h = rune::memo::digest(&(
@@ -401,6 +452,7 @@ impl Markdown {
                 self.tasks_read_only,
                 self.selectable,
                 self.scroll_wide,
+                self.tentative,
             ));
             return rune::memo::cached(h, || self.render_uncached(style));
         }
@@ -422,13 +474,14 @@ impl Markdown {
             starts.iter().map(|at| self.block_keys.iter().find(|(offset, _)| offset == at)
                 .map_or_else(String::new, |(_, key)| key.clone())).collect::<Vec<_>>()
         };
-        let r = Renderer { s: style.clone(), highlights: self.highlights, reveal: self.reveal, streaming: self.streaming, on_link: self.on_link, on_link_secondary: self.on_link_secondary, link_look: self.link_look, link_help: self.link_help, link_ring: self.link_ring,
-            on_task: self.on_task, tasks_read_only: self.tasks_read_only, selectable: self.selectable, scroll_wide: self.scroll_wide,
+        let r = Renderer { s: style.clone(), highlights: self.highlights, reveal: self.reveal, streaming: self.streaming, on_link: self.on_link, on_link_secondary: self.on_link_secondary, link_look: self.link_look, link_help: self.link_help, link_ring: self.link_ring, code_link: self.code_link,
+            on_task: self.on_task, tasks_read_only: self.tasks_read_only, selectable: self.selectable, scroll_wide: self.scroll_wide, tentative: self.tentative,
             highlighter: self.highlighter, sources, next_source: Cell::new(0), tasks, next_task: Cell::new(0),
             current_block_key: RefCell::new("b0".into()),
             #[cfg(feature = "mermaid")]
-            diagram_frame: self.diagram_frame, code_frame: self.code_frame, flow: Cell::default() };
-        let root = r.blocks(&blocks, &maps, &keys, true).selection_group(self.selectable);
+            diagram_frame: self.diagram_frame, code_frame: self.code_frame, quote_frame: self.quote_frame, link_favicon: self.link_favicon, images: self.images, on_image: self.on_image, flow: Cell::default() };
+        // The document reads the way its first words do; until any arrive, the way it was asked.
+        let root = bidi::directed(r.blocks(&blocks, &maps, &keys, true), bidi::blocks_dir(&blocks).or(self.tentative)).selection_group(self.selectable);
         if !(self.selectable && self.copy_source) { return root; }
         let names: Rc<[String]> = rendered_keys(blocks.len(), &keys).into();
         let src: Rc<str> = self.src.into();

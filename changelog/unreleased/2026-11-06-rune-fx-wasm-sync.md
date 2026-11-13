@@ -1,0 +1,3 @@
+- rune-fx builds for the web next to Rune's WebGPU backend: pipeline compilation no longer requires a `Sync` device on wasm32, where wgpu's device isn't `Sync` and compilation runs serially.
+- Web: a window with a compositor now records effect slot marks (`Runtime::track_marks`), as desktop windows do, so `rt.marks` tells a compositor's slots apart instead of reading 0 for all of them.
+- `scripts/web-build.sh` copies the full Inter faces beside `app.js` on Windows too: the build's dependency file lists backslash paths there, so the forward-slash match never found them and the page's after-first-frame font fetch got 404s.

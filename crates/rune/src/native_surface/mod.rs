@@ -14,6 +14,7 @@ pub(crate) mod place;
 #[cfg(target_os = "windows")]
 pub mod windows;
 pub use pipeline::SurfaceRenderer;
+pub(crate) use pipeline::Building;
 use std::sync::{Arc, Mutex};
 use crate::time::Instant;
 
@@ -65,6 +66,9 @@ pub(crate) enum Source {
     PixelBuffer(macos::PixelBuffer),
     #[cfg(target_os = "windows")]
     Shared(windows::SharedTexture),
+    /// A video decoder's NV12 picture and the fence value that marks it written.
+    #[cfg(target_os = "windows")]
+    Decoded(Arc<windows::DecodedPlanes>, u64),
 }
 pub(crate) struct Frame {
     pub id: u64,
@@ -117,8 +121,8 @@ impl Orient {
 /// Submit is a CPU monotonic timestamp. Completion is callback-observed CPU time;
 /// GPU start/end are render-pass timestamp-query seconds on the GPU clock, not `Instant`
 /// or display time. Their difference is GPU duration; the epoch is backend-specific.
-/// GPU times are absent when unsupported, overridden by caller timing, or all timing
-/// slots are in flight. CPU submission/completion notifications are still delivered.
+/// GPU times are absent when unsupported, overridden by caller timing, all timing slots are
+/// in flight, or no drawn surface has an observer (`set_observer`). CPU submission/completion notifications are still delivered.
 #[derive(Clone, Debug)]
 pub struct FrameTiming {
     pub frame_id: u64,
@@ -174,10 +178,18 @@ impl NativeSurface {
         Some(video.pull(self, clock, wake))
     }
     pub fn set_waker(&self, waker: crate::Waker) {
-        self.0.lock().unwrap().waker = Some(waker);
+        // The replaced waker's captures drop after the lock: one may read this surface's counts
+        // and would deadlock here.
+        let old = self.0.lock().unwrap().waker.replace(waker);
+        drop(old);
     }
     pub fn set_observer(&self, observer: FrameObserver) {
-        self.0.lock().unwrap().observer = Some(observer);
+        let old = self.0.lock().unwrap().observer.replace(observer);
+        drop(old);
+    }
+    /// Whether an observer listens: only then does a draw read GPU times.
+    pub(crate) fn observed(&self) -> bool {
+        self.0.lock().unwrap().observer.is_some()
     }
     pub fn timing(&self) -> Option<FrameTiming> {
         self.0.lock().unwrap().timing.clone()
@@ -285,6 +297,13 @@ impl NativeSurface {
         });
         Ok(())
     }
+    /// Shows a decoded NV12 picture (`video::windows`), sampled in place once its fence reaches
+    /// `value`.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn push_decoded(&self, planes: Arc<windows::DecodedPlanes>, value: u64, frame_id: u64, format: Format, color: ColorInfo, orient: Orient) {
+        let size = planes.size;
+        self.replace(Frame { id: frame_id, size, format, color, orient, source: Source::Decoded(planes, value) });
+    }
     fn replace(&self, frame: Frame) {
         let (old, wake) = {
             let mut s = self.0.lock().unwrap();
@@ -295,7 +314,7 @@ impl NativeSurface {
             wake();
         }
     }
-    #[cfg(test)]
+    #[cfg(any(test, target_os = "windows"))]
     pub(crate) fn latest(&self) -> Option<Arc<Frame>> {
         self.0.lock().unwrap().latest.clone()
     }

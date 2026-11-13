@@ -188,8 +188,14 @@ impl<const N: usize> Passes<N> {
 
 /// Runs `f` on every item, the first on this thread and the rest on their own (Metal compiles
 /// pipelines concurrently), or one after another where there are no threads.
+#[cfg(target_arch = "wasm32")]
+fn in_parallel<T>(items: &[T], f: impl Fn(&T)) {
+    // The web's wgpu device isn't `Sync`, and there are no threads to share it with anyway.
+    items.iter().for_each(f);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn in_parallel<T: Sync>(items: &[T], f: impl Fn(&T) + Sync) {
-    #[cfg(not(target_arch = "wasm32"))]
     if let [first, rest @ ..] = items
         && !rest.is_empty()
     {

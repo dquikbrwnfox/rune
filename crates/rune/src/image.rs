@@ -23,7 +23,10 @@ pub(crate) struct Mip {
     pub pixels: Vec<u8>,
 }
 pub(crate) struct Decoded {
+    /// The image, or an animation's first frame.
     pub mips: Vec<Mip>,
+    /// An animation's other frames and timing.
+    pub motion: Option<Box<animated::Motion>>,
 }
 struct State {
     id: ImageId,
@@ -131,18 +134,42 @@ impl Input {
         })
     }
 }
-struct Job { image: Image, input: Input }
-/// Decoder threads per cache, at most one per core.
+#[cfg(not(target_arch = "wasm32"))]
+struct Job { image: Image, input: Input, waker: crate::Waker }
+/// Decoder threads for the process, at most one per core.
 #[cfg(not(target_arch = "wasm32"))]
 const DECODERS: usize = 4;
 
+/// The process's decoder threads, shared by every cache and started by the first image to
+/// decode: an app that makes a cache per feature, or shows no image, pays no thread for it.
+#[cfg(not(target_arch = "wasm32"))]
+fn decoders() -> &'static mpsc::Sender<Job> {
+    static JOBS: OnceLock<mpsc::Sender<Job>> = OnceLock::new();
+    JOBS.get_or_init(|| {
+        let (jobs, receive) = mpsc::channel::<Job>();
+        // A session opening on several screenshots decodes them side by side, not one by one.
+        let receive = Arc::new(Mutex::new(receive));
+        for _ in 0..DECODERS.min(std::thread::available_parallelism().map_or(1, |n| n.get())) {
+            let receive = receive.clone();
+            std::thread::Builder::new().name("rune-images".into()).spawn(move || {
+                loop {
+                    let Ok(job) = receive.lock().unwrap_or_else(|e| e.into_inner()).recv() else { return };
+                    job.image.finish(job.input.decode_caught());
+                    (job.waker)();
+                }
+            }).expect("image worker");
+        }
+        jobs
+    })
+}
+
 /// Construct once during app setup. The cache deduplicates by content, not a path or pointer;
-/// dropping all handles releases decoded pixels. Dropping the cache stops its worker after
-/// queued requests complete. The waker should be the one supplied by `AppSpec::setup`.
+/// dropping all handles releases decoded pixels. Its images decode on the process's decoder
+/// threads, which every cache shares. The waker should be the one supplied by `AppSpec::setup`.
 pub struct ImageCache {
     entries: Mutex<HashMap<ImageId, Weak<State>>>,
     #[cfg(not(target_arch = "wasm32"))]
-    jobs: mpsc::Sender<Job>,
+    waker: crate::Waker,
     #[cfg(target_arch = "wasm32")]
     wake: crate::Waker,
 }
@@ -153,26 +180,17 @@ impl ImageCache {
     }
     #[cfg(not(target_arch = "wasm32"))]
     pub fn new(waker: crate::Waker) -> Self {
-        let (jobs, receive) = mpsc::channel::<Job>();
-        // A session opening on several screenshots decodes them side by side, not one by one.
-        let receive = Arc::new(Mutex::new(receive));
-        for _ in 0..DECODERS.min(std::thread::available_parallelism().map_or(1, |n| n.get())) {
-            let (receive, waker) = (receive.clone(), waker.clone());
-            std::thread::Builder::new().name("rune-images".into()).spawn(move || {
-                loop {
-                    let Ok(job) = receive.lock().unwrap_or_else(|e| e.into_inner()).recv() else { return };
-                    job.image.finish(job.input.decode_caught());
-                    waker();
-                }
-            }).expect("image worker");
-        }
-        Self { entries: Mutex::new(HashMap::new()), jobs }
+        Self { entries: Mutex::new(HashMap::new()), waker }
     }
 
-    /// PNG, JPEG, modern ICNS containing a PNG representation, or SVG (plain or gzipped SVGZ,
-    /// recognised by its content). An SVG rasterizes at twice its own size; use
+    /// PNG (APNG animates), JPEG, GIF and WebP (both animate), BMP, ICO, AVIF (with the `avif`
+    /// feature; its first frame), modern ICNS containing a PNG representation, or SVG (plain or
+    /// gzipped SVGZ, recognised by its content). An SVG rasterizes at twice its own size; use
     /// [`ImageCache::svg`] to rasterize it at the size it draws at. Legacy ICNS codecs return an
-    /// explicit error; callers can provide platform-decoded RGBA instead.
+    /// explicit error; callers can provide platform-decoded RGBA instead. An animation decodes
+    /// every frame on the worker, and plays only while an element draws it in a shown window.
+    /// On web the browser decodes everything but PNG, SVG and ICNS, so GIF and WebP show their
+    /// first frame there.
     pub fn load(&self, bytes: impl Into<Arc<[u8]>>) -> Image {
         let bytes = bytes.into();
         let mut hash = blake3::Hasher::new();
@@ -277,7 +295,7 @@ impl ImageCache {
         let image = Image::new(Arc::new(State { id, pixels: crate::Pixels::from_url(url, srcset), decoded: OnceLock::new() }));
         entries.insert(id, Arc::downgrade(&image.0));
         #[cfg(not(target_arch = "wasm32"))]
-        if self.jobs.send(Job { image: image.clone(), input }).is_err() {
+        if decoders().send(Job { image: image.clone(), input, waker: self.waker.clone() }).is_err() {
             let _ = image.0.decoded.set(Err(ImageError("image worker stopped".into())));
         }
         #[cfg(target_arch = "wasm32")]
@@ -295,6 +313,11 @@ impl ImageCache {
                         if !wanted(&weak) { return; }
                         match fetched { Ok(fetched) => from_url::land_in_slices(&url, fetched, px).await, Err(e) => Err(e) }
                     }
+                    Input::Encoded(bytes) if browser_decodes(&bytes) => {
+                        let decoded = from_url::decode_in_browser(&bytes).await;
+                        if !wanted(&weak) { return; }
+                        match decoded { Ok(fetched) => from_url::land_in_slices("image", fetched, 0).await, Err(e) => Err(e) }
+                    }
                     input => input.decode(),
                 };
                 let Some(state) = weak.upgrade() else { return };
@@ -304,6 +327,13 @@ impl ImageCache {
         }
         image
     }
+}
+
+/// Encoded bytes a web build hands to the browser's codecs: everything but PNG (decoded exactly,
+/// alpha and all, by Rune), SVG and ICNS.
+#[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
+fn browser_decodes(bytes: &[u8]) -> bool {
+    !bytes.starts_with(b"\x89PNG\r\n\x1a\n") && !bytes.starts_with(b"icns") && !is_svg(bytes)
 }
 
 /// Whether anything still holds the image a fetch is for.
@@ -602,7 +632,12 @@ fn decode(bytes: &[u8]) -> Result<Decoded, ImageError> {
         let (w, h, rgba) = svg_rgba(bytes, 0)?;
         return mip_chain(w, h, &rgba);
     }
+    if avif::is_avif(bytes) {
+        let (w, h, rgba) = avif::rgba(bytes)?;
+        return mip_chain(w, h, &rgba);
+    }
     let bytes = if bytes.starts_with(b"icns") { icns_png(bytes)? } else { bytes };
+    if let Some(animation) = animated::decode(bytes) { return animation; }
     use image::ImageDecoder;
     let error = |e: image::ImageError| ImageError(e.to_string());
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
@@ -622,6 +657,15 @@ fn decode(bytes: &[u8]) -> Result<Decoded, ImageError> {
     image.apply_orientation(orientation);
     let image = image.into_rgba8();
     mip_chain(image.width(), image.height(), image.as_raw())
+}
+
+/// A PNG decoded to 8-bit RGBA by the PNG decoder alone. `image::load_from_memory_with_format`
+/// dispatches on the format at run time, which links every codec the crate is built with (JPEG,
+/// WebP, GIF, BMP, ICO) into an app that only ever reads PNGs from the clipboard or a cursor.
+/// The same decoder and limits as that call's PNG arm.
+pub(crate) fn png_rgba8(bytes: &[u8]) -> image::ImageResult<image::RgbaImage> {
+    let decoder = image::codecs::png::PngDecoder::with_limits(std::io::Cursor::new(bytes), image::Limits::default())?;
+    Ok(image::DynamicImage::from_decoder(decoder)?.into_rgba8())
 }
 
 fn icns_png(bytes: &[u8]) -> Result<&[u8], ImageError> {
@@ -648,8 +692,11 @@ fn icns_png(bytes: &[u8]) -> Result<&[u8], ImageError> {
     best.ok_or_else(invalid)
 }
 
+pub(crate) mod animated;
+mod avif;
 mod from_url;
 mod mips;
+pub(crate) mod pixels;
 use mips::mip_chain;
 #[cfg(test)]
 use mips::byte;
@@ -697,9 +744,10 @@ mod tests {
         let cache = ImageCache::new(Arc::new(move || { let _ = tx.send(()); }));
         let large = cache.rgba(3000, 3000, vec![128; 3000 * 3000 * 4]);
         let small = cache.rgba(1, 1, vec![20, 40, 60, 255]);
-        rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        // Order is the point, not speed: a load spike must not fail this.
+        rx.recv_timeout(std::time::Duration::from_secs(120)).unwrap();
         assert!(small.is_ready() && !large.is_ready());
-        rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap();
+        rx.recv_timeout(std::time::Duration::from_secs(120)).unwrap();
         assert!(large.is_ready());
     }
 
@@ -758,6 +806,7 @@ mod tests {
             let mut encoded = std::io::Cursor::new(Vec::new());
             source.write_to(&mut encoded, format).unwrap();
             let bytes = encoded.into_inner();
+            assert_eq!(browser_decodes(&bytes), format == image::ImageFormat::Jpeg, "web decodes JPEG in the browser, PNG itself");
             let d = decode(&bytes).unwrap();
             assert_eq!((d.mips[0].width, d.mips[0].height), (8, 4));
             assert_eq!((d.mips.last().unwrap().width, d.mips.last().unwrap().height), (1, 1));
@@ -767,6 +816,7 @@ mod tests {
                 icns.extend_from_slice(b"icp4");
                 icns.extend_from_slice(&((bytes.len() + 8) as u32).to_be_bytes());
                 icns.extend_from_slice(&bytes);
+                assert!(!browser_decodes(&icns));
                 assert_eq!(decode(&icns).unwrap().mips[0].pixels, d.mips[0].pixels);
                 icns[12..16].copy_from_slice(&0u32.to_be_bytes());
                 assert!(decode(&icns).is_err());

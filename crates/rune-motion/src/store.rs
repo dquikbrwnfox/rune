@@ -12,14 +12,18 @@
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 
+use crate::carry::Carry;
 use crate::curve::{Anim, Blend, Curve, Decay, Velocity};
 use crate::layer::{Eps, Kind, Layer};
 use crate::props::{NodeId, Prop, PropClass, PropId};
 use crate::spring::Spring;
 use crate::value::{Animatable, MAX_LANES, lanes};
 
+mod started;
 mod tracks;
 mod typed;
+
+use self::tracks::Mode;
 
 const NONE: u32 = u32::MAX;
 /// Most additive layers a lane keeps before it collapses them into one merged segment.
@@ -163,7 +167,9 @@ pub struct AnimationStore {
     t_meta: Vec<Meta>,
     /// The track's clock: 0 is the store's own, otherwise an index into `clocks`.
     t_clock: Vec<u32>,
-    /// On a stopped clock and already sampled where it holds, so `tick` skips it.
+    /// Sampled at its held pose by the last tick (in whichever [`Mode`] it holds), so `tick`
+    /// can skip it until [`mode`](Self::mode) says it moves. [`resample`](Self::resample)
+    /// clears it wherever a track's timing or pose changes.
     t_held: Vec<bool>,
     track_free: Vec<u32>,
 
@@ -177,6 +183,9 @@ pub struct AnimationStore {
     /// where these are read, and freeing a track never scans them.
     touched: Vec<TrackId>,
     set_touched: Vec<TrackId>,
+    /// Tracks started or retargeted since the last tick, and between the two before (`started`).
+    starts: Vec<TrackId>,
+    ticked_starts: Vec<TrackId>,
 
     extra: Vec<Extra>,
     extra_free: u32,
@@ -186,8 +195,7 @@ pub struct AnimationStore {
     index: FxMap<(u64, u16), u32>,
     node_head: FxMap<u64, u32>,
 
-    events: Vec<MotionEvent>,
-    events_seen: usize,
+    events: Carry<MotionEvent>,
     retarget_audit: Option<RetargetAudit>,
 }
 
@@ -226,14 +234,15 @@ impl AnimationStore {
             active: Vec::new(),
             touched: Vec::new(),
             set_touched: Vec::new(),
+            starts: Vec::new(),
+            ticked_starts: Vec::new(),
             extra: Vec::new(),
             extra_free: NONE,
             pending: Vec::new(),
             pending_free: NONE,
             index: FxMap::default(),
             node_head: FxMap::default(),
-            events: Vec::new(),
-            events_seen: 0,
+            events: Carry::new(),
             retarget_audit: None,
         }
     }
@@ -324,7 +333,6 @@ impl AnimationStore {
         while t != NONE {
             self.rebase(t as usize, delta);
             self.t_clock[t as usize] = new;
-            self.t_held[t as usize] = false;
             t = self.t_meta[t as usize].node_next;
         }
         self.release_clock(old);
@@ -399,6 +407,7 @@ impl AnimationStore {
 
     /// Shifts every absolute time of track `t` by `delta`.
     fn rebase(&mut self, t: usize, delta: f64) {
+        self.resample(t);
         if delta == 0.0 {
             return;
         }
@@ -448,12 +457,14 @@ impl AnimationStore {
     /// Samples every active track at `now()`, applies due delayed animations, settles finished
     /// tracks. Allocation-free once buffers have grown to the working-set size.
     pub fn tick(&mut self) {
-        self.events.drain(..self.events_seen);
+        self.events.begin();
         self.touched.clear();
         let meta = &self.t_meta;
         let live = |id: &&TrackId| meta[id.index as usize].alive && meta[id.index as usize].generation == id.generation;
         self.touched.extend(self.set_touched.iter().filter(live));
         self.set_touched.clear();
+        std::mem::swap(&mut self.starts, &mut self.ticked_starts);
+        self.starts.clear();
         let clocked = !self.node_clock.is_empty();
         let mut i = 0;
         while i < self.active.len() {
@@ -461,16 +472,16 @@ impl AnimationStore {
             let now = if clocked { self.time_of(t) } else { self.now };
             // Nothing moves on a stopped clock, or on a track that only waits for a delayed
             // start: once sampled where it holds, it isn't touched again until it moves.
-            let held = (clocked && self.frozen(t)) || (now >= self.t_settle_at[t] && self.t_next_due[t] > now);
-            if held && self.t_held[t] {
+            let mode = self.mode(t);
+            if mode.holds() && self.t_held[t] {
                 i += 1;
                 continue;
             }
-            self.t_held[t] = held;
             self.touched.push(TrackId { index: t as u32, generation: self.t_meta[t].generation });
             if self.t_next_due[t] <= now {
                 self.apply_due(t, now);
             }
+            self.t_held[t] = mode.holds();
             let l0 = self.t_lane0[t] as usize;
             let n = self.t_n[t] as usize;
             let range = l0..l0 + n;
@@ -505,12 +516,12 @@ impl AnimationStore {
             }
             i += 1;
         }
-        self.events_seen = self.events.len();
+        self.events.end();
     }
 
     /// Events since the previous tick (settles, completions).
     pub fn events(&self) -> &[MotionEvent] {
-        &self.events
+        self.events.as_slice()
     }
 
     /// The values presented at the last tick for a track, as raw lanes.
@@ -562,7 +573,7 @@ impl AnimationStore {
         if self.node_clock.is_empty() {
             return !self.active.is_empty();
         }
-        self.active.iter().any(|&t| !self.frozen(t as usize))
+        self.active.iter().any(|&t| !matches!(self.mode(t as usize), Mode::Frozen))
     }
 
     pub fn track_len(&self) -> usize {
@@ -614,7 +625,7 @@ impl AnimationStore {
                 self.t_next_due[t] = f64::INFINITY;
                 self.t_slot[t] = NONE;
                 self.t_clock[t] = clock;
-                self.t_held[t] = false;
+                self.resample(t);
                 t as u32
             }
             None => {
@@ -901,6 +912,7 @@ impl AnimationStore {
         }
         self.t_next_due[t] = due;
         self.t_settle_at[t] = settle;
+        self.resample(t);
     }
 
     fn settle(&mut self, t: usize) {
@@ -987,9 +999,9 @@ impl AnimationStore {
         m.token = token;
         m.logical_at = logical_at;
         m.epoch = m.epoch.wrapping_add(1);
-        self.t_held[t] = false;
         self.recompute(t);
         self.activate(t);
+        self.starts.push(self.id_of(t));
     }
 
     fn cancel_pending(&mut self, l: usize) {

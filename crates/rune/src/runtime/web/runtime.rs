@@ -147,7 +147,7 @@ mod tests {
         event["kind"] = json!("edit");
         rt.web_edit(&event);
         assert_eq!(rt.state.text, "🦀 help");
-        assert!(rt.state.preedit.is_none());
+        assert!(rt.state.preedit().is_none());
         assert_eq!(rt.state.focus, rt.state.text.len());
         rt.web_edit(&event);
         assert_eq!(rt.state.text, "🦀 help", "stale context rejected");
@@ -212,7 +212,7 @@ fn byte_at(text: &str, utf16: usize) -> Option<usize> {
 impl<S: 'static> Runtime<S> {
     pub(crate) fn web_context(&self, mirror: &mut Mirror) -> bool {
         match self.focused_input().filter(|i| i.access.is_some()) {
-            Some(input) => mirror.update(self.focused.as_deref().unwrap_or_default(), Some(&input.edit)),
+            Some(input) => mirror.update(self.focus.path().unwrap_or_default(), Some(&input.edit)),
             None => mirror.update("", None),
         }
     }
@@ -252,14 +252,14 @@ impl<S: 'static> Runtime<S> {
 
     pub(crate) fn web_secure(&mut self, key: &str, text: String) {
         let event = crate::KeyEvent { key: crate::Key::Text(text), mods: crate::Mods::default() };
-        if self.focused.as_deref() == Some(key) && self.has_secure_focus() {
+        if self.focus.path() == Some(key) && self.has_secure_focus() {
             self.key(event);
         }
     }
 
     pub(crate) fn web_edit(&mut self, event: &serde_json::Value) {
         let Some(key) = event["key"].as_str() else { return };
-        if self.focused.as_deref() != Some(key) || self.has_secure_focus() { return; }
+        if self.focus.path() != Some(key) || self.has_secure_focus() { return; }
         let number = |key: &str| event[key].as_u64().and_then(|n| usize::try_from(n).ok());
         let Some(base) = number("base") else { return };
         let Some(expected) = event["expected"].as_str() else { return };
@@ -272,14 +272,14 @@ impl<S: 'static> Runtime<S> {
                 let Some((start, end)) = number("start").zip(number("end")) else { return EditOutcome::default() };
                 let Some((a, b)) = byte_at(expected, start).zip(byte_at(expected, end)) else { return EditOutcome::default() };
                 if a > b { return EditOutcome::default(); }
-                edit.ime(&Ime::Preedit(String::new(), None));
+                edit.ime(&Ime::Preedit(String::new(), None, Vec::new()));
                 let raw = (base + a, base + b);
                 edit.anchor = raw.0; edit.focus = raw.1;
                 edit.snap_to_pills();
                 let snapped = (edit.anchor, edit.focus) != raw;
                 let text = event["text"].as_str().unwrap_or_default();
                 if event["kind"] == "preedit" {
-                    edit.ime(&Ime::Preedit(text.to_owned(), Some((text.len(), text.len()))));
+                    edit.ime(&Ime::Preedit(text.to_owned(), Some((text.len(), text.len())), Vec::new()));
                     return EditOutcome::default();
                 }
                 edit.insert(text);
@@ -292,7 +292,7 @@ impl<S: 'static> Runtime<S> {
             }
             EditOutcome::default()
         }, &mut tx);
-        if composing_before || event["kind"] == "preedit" { self.ime_eat_key_up = true; }
+        if composing_before || event["kind"] == "preedit" { self.key_releases.ime_took_key(); }
         if changed { self.dirty = true; }
         merge(&mut self.pending, tx);
     }

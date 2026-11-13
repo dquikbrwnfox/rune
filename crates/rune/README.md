@@ -55,7 +55,8 @@ Rune's core crate: views, layout, animation, rendering, text and the native shel
   - The animation clock has a time scale, which the Settings speed slider drives.
 - **Renderer** (`render.rs`, `shader.wgsl`): one instanced uber-quad pipeline and one draw call per
   frame.
-  - Kinds: rounded rects (per-corner radius, border), analytic Gaussian shadows (outer and inset),
+  - Kinds: rounded rects (per-corner radius, a border drawn over the fill as CSS draws one, per-side
+    widths), analytic Gaussian shadows (outer and inset),
     vertical and angled linear gradients, circular and elliptical radial gradients (`KIND_RADIAL`),
     dashed border rings (`KIND_DASHED`), RGBA images, and glyphs from the atlas.
   - **Gradients** (`.gradient(top, bottom)`, `.radial_gradient(center, radius, stops)`,
@@ -99,16 +100,49 @@ Rune's core crate: views, layout, animation, rendering, text and the native shel
   `WindowSpec::font_smoothing`), or while running with `Tx::set_font_smoothing(mode)`, which
   rasterises the new mode's glyphs on the next frame (each mode keeps its own atlas entries, so a
   switch back is free). Modes:
-  - `On`, the default on macOS: CoreText's text with font smoothing on. Apple's pipeline (pens
-    floored to CoreGraphics' subpixel step, which depends on the ppem: fifths of a device pixel
-    below 8⅓ ppem, quarters to 11.1, thirds to 16.7, halves to 33.3 and whole pixels above; coverage
-    drawn as is; sRGB blending; CoreGraphics' curve flattening and its y autohinter at 7–18 ppem)
-    plus font smoothing's outline dilation, a radius set by the ink's luminance and the device
-    ppem (`text/macos/smoothing.rs`, `ApplePipeline::SMOOTHED`).
+  - `On`, the default on macOS and in a Mac's browser: CoreText's text with font smoothing on.
+    Apple's pipeline (pens floored to CoreGraphics' subpixel step, which depends on the ppem:
+    fifths of a device pixel below 8⅓ ppem, quarters to 11.1, thirds to 16.7, halves to 33.3 and
+    whole pixels above; coverage drawn as is; sRGB blending; CoreGraphics' curve flattening and
+    its y autohinter at 7–18 ppem) plus font smoothing's outline dilation, a radius set by the
+    ink's luminance and the device ppem (`text/macos/smoothing.rs`, `ApplePipeline::SMOOTHED`).
   - `Off`: what macOS browsers draw for `-webkit-font-smoothing: antialiased`, CoreText with font
-    smoothing off, and the default on every other platform (Linux, Windows, the web). Apple's
-    pipeline without the dilation (`ApplePipeline::UNSMOOTHED`); lighter than `On`.
-  Both work on every OS, since they are arithmetic on outlines. Blending is separate
+    smoothing off. Apple's pipeline without the dilation
+    (`ApplePipeline::UNSMOOTHED`); lighter than `On`. Coverage takes an exponent keyed to the
+    ink's luminance, the curve of Skia's grayscale text gamma.
+  - `DirectWrite`: Chromium's text on Windows. DirectWrite rasterises each
+    glyph as Skia's `SkScalerContext_DW` asks it to (the rendering mode the `gasp` table picks,
+    grid fitting on, grayscale antialiasing, the face at the run's variation coordinates, read in
+    place from Parley's bytes), pens sit on Skia's quarter pixels, and Skia's gamma tables
+    (sRGB, contrast 1, eight luminance buckets) weigh each mask by its ink
+    (`text/windows/`). Off Windows it draws as `Off`.
+  - `Windfoil`: Rune's own text with CoreText's weight, the same
+    on every OS. Each glyph's exact pixel coverage from its outline, Windfoil's closed-form box filter over
+    xy-monotone quadratics (DesLauriers 2026), with CoreText's dilation (times `TEXT_WEIGHT`,
+    0.93, which puts its ink within 1% of CoreText's) and y autohint applied per pixel, pens on
+    quarter pixels, coverage drawn as is (`text/outline/`, `text/windfoil.rs`, `outline.wgsl`).
+    Masks at rest are filled on the GPU by the shader that draws text whose scale moves (a zoom,
+    a presence scale, a text flight) straight from its outlines, at its resting pen and size
+    magnified, so it stays sharp and lands on the mask it rests as. A text's raster path
+    (`text/outline/path.rs`: still, moving, landing), each mask's residency (`text/atlas_fill.rs`:
+    uploaded, pending, filled) and the renderer's shader (`render/variant.rs`: Classic, Windfoil,
+    unavailable) are state machines. CJK faces up to 24 ppem draw their TrueType-hinted outlines
+    from whole-pixel pens, at half the dilation, so dense ideographs stay legible at 1x. Renderers
+    start with the Windfoil shader everywhere but macOS, where the Classic shader keeps drawing
+    until text asks for outlines; where it can't be built, the CPU fills the same masks
+    (`text/outline/cover.rs`) and moving text draws from them.
+  - `WindfoilChromium`, the default everywhere but macOS and a Mac's browser, then `Slug`,
+    `HintedGpu` and `Hinted`: the other ways to draw from the outline store. Each takes Chromium's weight (no dilation, Skia's text gamma):
+    Windfoil's box coverage of the design outline, Slug's two-ray winding (`outline_slug` in
+    `outline.wgsl`), the outline after skrifa's light autohint, and that autohinted outline on
+    whole-pixel pens, which is Chromium's text on Linux. `FontSmoothing::ALL` lists every mode and
+    `FontSmoothing::support` says whether this machine draws one as named (`text/support.rs`).
+  - `WindfoilRgb` and `ClearType` (Windows): subpixel text. Masks hold three coverages a pixel
+    (Windfoil's box about each subpixel, or DirectWrite's `CLEARTYPE_3x1`), and the window draws
+    them with a dual-source pipeline that blends each channel by its own (`render/variant.rs`,
+    `Lcd`). Layers draw them grayscale; without dual-source blending they draw as
+    `WindfoilChromium` and `DirectWrite`.
+  `On` and `Off` work on every OS, since they are arithmetic on outlines. Blending is separate
   (`srgb_blend`).
   `cargo run -p rune --example coretext_compare [-- --smoothing on|off]` measures
   each mode against CoreText references (`tests/coretext/`, `scripts/coretext-reference.sh`). The
@@ -173,9 +207,11 @@ Rune's core crate: views, layout, animation, rendering, text and the native shel
   multiplies with `press_scale`, `live_scale` and scale transitions (`origin` applies to all of
   them; `offset` ignores it), and nested scales and turns compose. Under all of them, text, icons
   and images transform with their box (link hit boxes and a text field's caret follow). Text under
-  a still scale rasterizes at the scaled size, so it stays crisp. While a scale springs, text
-  samples its rest-size glyphs, filtered, and turns crisp when the spring settles. That way a
-  spring doesn't rasterize a glyph at every frame's size. Text under an actively moving
+  a still scale rasterizes at the scaled size, so it stays crisp. While a scale springs (or a
+  presence transition runs), text samples glyphs rasterized at its nearest still ancestor's
+  scale (1, or an app's zoom), filtered, and turns crisp when the spring settles. That way a
+  spring doesn't rasterize a glyph at every frame's size, and text that only fades or slides
+  inside a zoomed window draws exactly as it will at rest. Text under an actively moving
   `live_scale` rasterizes at logarithmic $2^{1/4}$ scale buckets and re-rasterizes crisp at the
   exact resting scale once it holds still for 0.1 s; a changing `scale` samples rest-size glyphs
   while moving and re-rasterizes crisp at the resting scale after 0.1 s. A matched flight's own
@@ -633,9 +669,18 @@ app.run();
 
   Launch Services learns the scheme when the bundle is opened or registered (`lsregister -f
   MyApp.app`); then `open 'myapp://x'` launches or reaches the app. A bare `cargo run` binary has
-  no bundle and gets no links. iOS isn't wired yet (winit owns the scene delegate), and Windows
-  and Linux pass a link to a new process as a launch argument, so the hook never runs there;
-  read it from the arguments, with your own single-instance forwarding if you need one.
+  no bundle and gets no links. iOS isn't wired yet (winit owns the scene delegate), and Linux
+  passes a link to a new process as a launch argument, so the hook never runs there.
+- Links and relaunches on Windows: Windows starts a new process for each launch, passing a link
+  as an argument. The hook receives the links among the first process's arguments
+  (`scheme://…`) like the launching link on macOS. Call `rune::single_instance("com.example.myapp")`
+  first thing in `main` to keep one process: a later launch hands its arguments to the running
+  process over a per-user named pipe and lets it take the foreground, and `single_instance`
+  returns false so `main` returns without opening a window. Its links reach the hook; a launch
+  without links reopens the app (`App::on_reopen`, then the default, which also brings the front
+  window forward, restored). Register the scheme for the user, usually at install:
+  `HKEY_CURRENT_USER\Software\Classes\myapp` with an empty `URL Protocol` value and
+  `shell\open\command` set to `"C:\path\to\myapp.exe" "%1"`.
   `scripts/mac-app --scheme myapp` writes that entry and registers the bundle for you (see
   "Relaunching a Mac app" below).
 - Edge overlays (HUDs): see `App::overlay` below.
@@ -667,9 +712,9 @@ Staying fast afterwards is "Fast apps" (`site/src/FastApps.tsx`) and "Smooth scr
   `uber_native.metallib`, built from the MSL that backend emits (first `Renderer::new` 222 ms to 90 ms cold,
   4.0 ms to 0.9 ms warm). After editing `clip.wgsl` or `shader.wgsl`, run
   `cargo test -p rune --lib --features metal-backend precompiled_uber_metallib_is_fresh` on a Mac. If it says the MSL
-  is byte-identical, paste the printed lines into `uber_metallib_hash.rs`. If it says the MSL, flags or library hash
+  is byte-identical, paste the printed lines into `uber/metallib_hash.rs`. If it says the MSL, flags or library hash
   changed, run `scripts/precompile-metal-shaders.sh` (needs Xcode's Metal toolchain) and commit both libraries and
-  `uber_metallib_hash.rs`. Effect, lighting and blur shaders and iOS aren't precompiled; binary archives would need
+  `uber/metallib_hash.rs`. Effect, lighting and blur shaders and iOS aren't precompiled; binary archives would need
   wgpu support.
 - **The first frame draws during window creation** on macOS for visible windows (not launcher windows or panels).
   The first view build and layout run inside creation, right after the window-created callbacks, so keep the initial
@@ -797,6 +842,49 @@ true
   closed window, so call `cancel` from `App::on_close` to stop requests on close.
 
 Only the closure runs on the worker; the answer reaches state in `poll`, on the UI thread.
+
+### State machines (`rune::machine`)
+
+Anything with modes (a hover delay, a drag, a request and its retries, a dialog flow) is one
+`enum State` whose variants carry only what is valid in them, and one transition that returns
+what should happen instead of doing it:
+
+```rust
+use rune::machine::{Attempt, Effects, Seq};
+
+enum Tip { Idle, Waiting { attempt: Attempt, due: f64 }, Open }
+enum Event { Enter { now: f64 }, Leave, Due { attempt: Attempt, now: f64 } }
+enum Effect { WakeAt(f64) }
+
+fn step(seq: &mut Seq, tip: &mut Tip, event: Event) -> Effects<Effect> {
+    match (&*tip, event) {
+        (Tip::Idle, Event::Enter { now }) => {
+            let (attempt, due) = (seq.next(), now + 0.4);
+            *tip = Tip::Waiting { attempt, due };
+            Effects::one(Effect::WakeAt(due))
+        }
+        (Tip::Waiting { attempt, due }, Event::Due { attempt: a, now }) if *attempt == a && now >= *due => {
+            *tip = Tip::Open;
+            Effects::none()
+        }
+        (_, Event::Leave) => { *tip = Tip::Idle; Effects::none() }
+        _ => Effects::none(),
+    }
+}
+// A handler steps with `tx.clock()` and carries the effects out:
+for e in step(&mut s.seq, &mut s.tip, Event::Enter { now: tx.clock() }) {
+    match e { Effect::WakeAt(due) => tx.wake_at(due) }
+}
+```
+
+- **Illegal states don't exist.** `Waiting` without a deadline, or `Open` with one, can't be
+  built, so no code has to clear a flag another forgot.
+- **Timers are events.** Deadlines are on `Tx::clock` (the clock `poll` gets, virtual in headless
+  runs); `Tx::wake_at(due)` wakes `poll`, which feeds `Due` back into `step`.
+- **Attempts fence answers.** `Seq::next` issues an `Attempt` per request, timer or dialog; an
+  answer carrying an attempt the state no longer holds falls through to `_` and changes nothing.
+- **Effects stay inline.** `Effects<E>` holds up to two effects without allocating; `push` and
+  `extend` add more, and it iterates in order.
 
 ### Relaunching a Mac app (`scripts/mac-app`, `rune-mac`)
 
@@ -1154,7 +1242,9 @@ with `Runtime::window_focus(bool)`.
 `[f32; 4]`, `Color`). Call `set(value)` from a producer thread; Rune coalesces a
 wake for each visible subscribed window. Equal values and hidden windows do not
 wake. Bind with `.live_opacity(&level)`, `.live_offset(&cursor)`,
-`.live_scale(&scale)`, `.live_fill(&color)` or `.live_rect(&rect)`.
+`.live_scale(&scale)`, `.live_fill(&color)` or `.live_rect(&rect)`, and colours with
+`.live_text_color`, `.live_border`, `.live_shadow` (the first shadow's colour) and
+`.live_gradient(&top, &bottom)`. A rebuild keeps what a colour binding last set.
 `cursor.smooth(Spring::new(0.16, 0.0))` opts a binding into rune-motion smoothing.
 Views and layout do not rerun. Rects are presentation `[x,y,w,h]` in parent points,
 so text does not rewrap and siblings do not reflow. See
@@ -1241,6 +1331,7 @@ history-exclusion marker and expires on Rune's shared clipboard worker. Expiry
 compares the current text and, on macOS/Windows, the clipboard revision; copying
 something else cancels the old expiry. Linux's portable API exposes no revision,
 so it compares text. Clipboard managers must honor the platform marker themselves.
+On Windows, locking the session (Win+L) clears a secret still on the clipboard at once.
 
 Put `.on_paste(|s: &mut State, text: &str, tx| { ... })` on the view root (or modal
 root) to handle Cmd/Ctrl-V when no field is focused. `tx.request_paste()` requests
@@ -1387,6 +1478,12 @@ newline on `Shift+Return` and pastes plain text. The mark and block methods work
   `edit.paragraphs()`, adding soft breaks with `.with_soft_breaks(edit.soft_breaks().to_vec())`
   (or `set_soft_breaks`) and dropping undo/redo stacks with `edit.clear_history()`. Accessibility
   roles (`textbox`) and plain-text values are unchanged.
+- **Undo history past a restart**: `edit.history_json(max_steps, max_bytes)` gives the newest
+  undo and redo steps (each the document before and after it: text, selection, marks, blocks)
+  as JSON for the app to store, and `edit.restore_history_json(&v)` takes them back when they
+  lead to the field's document; a history stored a few keystrokes early gets one step from where
+  it ends to the document. A secure field gives and takes none. `edit.history_len()` (undo, redo)
+  changes when the history moves, so an app can store it only then.
 - **Allowed formatting**: `.allow_marks([Mark::Bold, Mark::Italic, ..])` and
   `.allow_blocks([Block::Bullet(0), ..])` keep a field to what its app can store (Markdown has no
   underline, say). The field never holds the rest: its shortcut (`⌘U`) goes on to the app's key
@@ -1556,7 +1653,9 @@ Once the system drag starts, Rune drops the pointer capture and hover, so nothin
 Files are offered as copies (`DragItem::allow_move` also offers a move), an app bundle can be
 dropped into System Settings' privacy lists, and the picture under the pointer is a snapshot of
 the element unless `DragItem::image` sets one. `on_drag_end` receives `DragOutcome::Copied`,
-`Moved`, `Linked` or `Cancelled`.
+`Moved`, `Linked` or `Cancelled`. The app's own windows take no drop from its drags unless
+`DragItem::within_app` offers it to them: their `on_drop_files` targets then receive the files
+as they would from Finder (an image dragged from a list into a composer).
 
 macOS only for now. Elsewhere `drag_out` is ignored and the element keeps its press and
 `on_drag` behaviour. Headless runs record `drag-out <path>` in `--trace` and mark the node
@@ -1829,9 +1928,13 @@ and push retained immutable CoreVideo buffers from a decoder thread. macOS uses
 CVMetalTextureCache and wgpu-hal Metal texture import without CPU pixel copies.
 BGRA and NV12 420v/420f are supported with BT.601/709 matrices and sRGB/709 transfer
 attachments. Pixel-matched video uses exact texel loads at Retina scale.
+A window's or overlay's first drawn surface compiles the surface pipeline on a thread of its
+own; the surface draws from the frame after it's ready, which the window's live wake asks for.
+Headless runs compile it in place.
 
 Per-draw notifications carry source frame ID, CPU submit time, completion-observed time,
-and optional GPU render-pass timestamp queries. These are **not presented-frame timestamps**:
+and optional GPU render-pass timestamp queries, read only while a drawn surface has an observer
+(`set_observer`): resolving them costs a submission a frame. These are **not presented-frame timestamps**:
 true presentation feedback needs the planned own Mac shell with CAMetalLayer /
 CAMetalDisplayLink. wgpu-hal 30 does not expose its acquired drawable, and wgpu 30
 forbids mixing normal encoding with the raw command-buffer completed-handler escape
@@ -1860,8 +1963,10 @@ tap.play();
 ```
 
 - **Controls and state**: `play` (from the start after `Ended`), `pause`, `seek` (clamped),
-  `set_rate`, `set_looping`, `set_muted`; `state()` is `Loading`, `Ready`, `Playing`, `Ended`
-  or `Failed(message)`, plus `time()`, `duration()`, `natural_size()`.
+  `set_rate`, `set_looping`, `set_muted`, `set_volume`; `state()` is `Loading`, `Ready`, `Playing`, `Ended`
+  or `Failed(message)`, plus `time()`, `duration()`, `natural_size()` and `has_sound()`
+  (whether the clip has a sound track it can play, as a page's controls grey their mute
+  button without one; `None` until the clip's facts are read).
 - **Sound**: `Player::file`/`url`/`new` make videos, which start muted. `Player::audio` makes
   an audio clip, which starts unmuted. `set_muted` changes either.
 - **Request headers**: `Player::request(url).header("Authorization", token).audio()` (or
@@ -1900,6 +2005,25 @@ tap.play();
   follows the virtual clock of the runtime on the thread that made it, as a video's does
   (pause, seek, rate, loop, and the end, which wakes the clip's waker), with no sound. `--tree` adds a `video` object (`kind`, `state`, `time`,
   `duration`, `size`, `rate`, `looping`, `muted`, `error`) to video elements.
+- **Windows**: Media Foundation's source reader decodes each clip on a thread of its own, with
+  the GPU's decoder (DXVA, through a D3D11 device on the adapter Rune draws with) where it has
+  one and in software otherwise. The source resolves while that device comes up. Each picture
+  is copied on the GPU into a small ring of shared NV12 textures, made as pictures need them (a
+  paused clip makes one), that Rune's D3D12 device samples in place, ordered by fences, with the
+  draw's bind group kept per texture: no CPU copy, and
+  the UI thread only swaps the picture for the refresh the frame presents at (read from DWM's
+  timing). A playing clip asks for the next frame when its next picture is due, not every
+  refresh. A clip nobody draws stops decoding (its queue fills); a muted one picks up at its
+  picture when drawn again, and after 3 s undrawn its decoder lets go of everything but the
+  picture on screen. Loops seek back while the last pictures still wait, so there's no gap.
+  Sound plays on the default output through WASAPI, following the playback clock. Media
+  Foundation, D3D11 and WASAPI load on the first clip, through `GetProcAddress`: nothing at
+  launch, nothing in the import table. Formats are what Media Foundation reads: mp4/mov/m4v
+  (H.264; HEVC, VP9 and AV1 with their system extensions), WebM, mp3, m4a/AAC, wav, flac. A
+  Windows N edition without the Media Feature Pack fails every clip with a message saying so.
+  `RUNE_VIDEO_LOG=1` prints each open's steps in microseconds (`frames` adds every picture);
+  `RUNE_VIDEO_DECODE=software` skips the GPU decoder. Request headers aren't sent on Windows
+  yet: such a clip fails with a message.
 - **Other platforms**: every clip reports `Failed("video playback isn't supported on this
   platform yet")` (or the audio equivalent), and video draws a neutral grey placeholder.
 
@@ -2305,6 +2429,27 @@ cargo build --release -p settings
 target/release/settings                       # the window
 ```
 
+### Depending on Rune
+
+An app pins a `dev` rev and patches the same four crates Rune does, from the same rev. A
+dependency's `[patch]` doesn't reach the workspace that depends on it, and without these the app
+builds against stock crates: winit's patch carries macOS input-method and Windows window-creation
+fixes, parley_engine's carries bidi and shaping fixes.
+
+```toml
+[dependencies]
+rune = { git = "https://github.com/anomalyco/rune", rev = "<rev>" }
+
+[patch.crates-io]
+winit = { git = "https://github.com/anomalyco/rune", rev = "<rev>" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "<rev>" }
+wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "<rev>" }
+accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "<rev>" }
+```
+
+The list is the `[patch.crates-io]` table in Rune's root `Cargo.toml`; when a bump adds an entry
+there, add it here too.
+
 ### Linux
 
 Linux builds link `libxkbcommon` (layer-shell and display-targeted overlays) and
@@ -2328,6 +2473,11 @@ Without `libxkbcommon-x11-0` every windowed example panics at startup with
 it, and the app then runs under Xvfb. Headless `--snap` runs don't need a display or the XKB library.
 
 ## Agent tooling (headless, no window, same renderer, fixed virtual clock)
+
+Debug builds always take these arguments. A release build takes them with Rune's `tooling`
+feature (`rune = { ..., features = ["tooling"] }`; Rune's examples have it); without it the app
+links only its window, and a headless argument makes `run` fail saying so. `--native --trace` is
+the window's own and works either way.
 
 ```sh
 S=target/release/settings
@@ -2353,6 +2503,8 @@ $L --desktop examples/launcher/backdrop.png --script examples/launcher/scripts/d
   `gap`, default 0.15 s between presses) and `drag` (`dx`, `dy`, `dur`) events, at `x,y` in points or at an element by `key` (or a path of keys such as `slider/knob`, where elements without keys
   between them don't count).
   `{"reopen": true}` reopens the app, as a click on its Dock icon (see "App lifetime").
+  `{"open_url": "myapp://…"}` hands `App::on_open_url` a link, as the system does when a link
+  opens the app.
   `menu-pick` (with an `id`) and `menu-cancel` answer an open pop-up menu, `file-dialog` (with
   a `path`) and `file-dialog-cancel` an open file dialog (see "File dialogs"). `drag_files` and
   `drop_files` drag files in from another app (see "Dropping files in from other apps").
@@ -2395,6 +2547,9 @@ $L --desktop examples/launcher/backdrop.png --script examples/launcher/scripts/d
   the app's root background, falling back to `--theme` when the background is transparent.
   `--pointer` adds a ripple at each press. A separate runtime draws both after the app, so they
   appear in `--video`, `--out`, `--snap` and strips but never in `--tree` or `--trace`.
+  That runtime is a second `Runtime` in the exe (about 1.46 MB), so a release build draws them only
+  with the `keys-overlay` feature (which includes `tooling`; Rune's examples have it); debug builds
+  always do.
 - **Desktop recordings**: `--desktop BACKDROP.png` renders all of a multi-window app's visible
   windows into one frame, so a launcher, its panel and the app's other windows record together
   the way a screen recording would show them. Each window renders with its own state into its
