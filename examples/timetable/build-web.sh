@@ -8,6 +8,11 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 root=$(cd "$here/../.." && pwd)
 out=${1:-target/web-tt}
 cd "$root"
+# Our own page, which web-build.sh keeps: it starts the app on the GPU at once. Rune's default for a
+# full-window app is to start on the CPU and ask for the GPU after the first frame, and with a
+# compositor that start can stall before the GPU is ever asked.
+mkdir -p "$out"
+cp "$here/index.html" "$out/index.html"
 bash scripts/web-build.sh timetable --opt --out "$out"
 if [[ -n ${TIMETABLE_DATA:-} && -f $TIMETABLE_DATA ]]; then
     cp "$TIMETABLE_DATA" "$out/celcat.json"

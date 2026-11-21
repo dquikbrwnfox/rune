@@ -140,6 +140,7 @@ milliseconds; the timing is logged to the console as `timetable: N courses, fetc
 - `web-build.sh --dev` fails under Git Bash on Windows (quoted `--config` keys); the release build
   is fast once kache has Rune cached.
 - The wasm target must be installed on the pinned toolchain (`rustup target add wasm32-unknown-unknown` in this repo).
+- `index.html` is ours, not generated: it sets `RUNE_CPU_FIRST = "off"` so the app starts on the GPU at once. With Rune's default CPU-first start, a page with a compositor can stall before the GPU is asked (a blank page).
 - Browser automation that inserts text (rather than sending key events) doesn't reach a canvas
   app's shortcuts; real keystrokes do.
 - Additive effects blow out on paper, so fire, smoke, lightning and the extra point lights are scaled
