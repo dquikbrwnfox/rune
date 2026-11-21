@@ -71,21 +71,27 @@ impl Tape {
     }
 
     /// One element as this frame presents it. `name` runs only the first time `node` is seen.
+    #[inline]
     pub(crate) fn sample(&mut self, node: u64, q: Q, name: impl FnOnce() -> String) {
         let id = match self.ids.get(&node) {
             Some(&id) => id,
-            None => {
-                let id = self.names.len() as u32;
-                let name = name();
-                self.name_bytes += name.len();
-                self.names.push(name);
-                self.ids.insert(node, id);
-                self.last.push([i32::MIN; FIELDS]);
-                self.seen.push(0);
-                self.base.push(None);
-                id
-            }
+            None => self.intern(node, name()),
         };
+        self.record_sample(id, q);
+    }
+
+    fn intern(&mut self, node: u64, name: String) -> u32 {
+        let id = self.names.len() as u32;
+        self.name_bytes += name.len();
+        self.names.push(name);
+        self.ids.insert(node, id);
+        self.last.push([i32::MIN; FIELDS]);
+        self.seen.push(0);
+        self.base.push(None);
+        id
+    }
+
+    fn record_sample(&mut self, id: u32, q: Q) {
         let i = id as usize;
         if self.seen[i] == self.serial { return; }
         // On screen last frame: sampled in the frame before this one.
@@ -121,6 +127,20 @@ impl Tape {
             self.compact();
             self.compact_at = (self.names.len() * 2).max(COMPACT_AT);
         }
+    }
+
+    /// A window at rest: forgets the elements nothing kept refers to now, not at the next
+    /// `compact_at` (each session or terminal opened and closed adds its own, and frames past
+    /// the window have gone into the base since), and gives back the space the ring grew to.
+    pub(crate) fn rest(&mut self) {
+        if self.paused { return; }
+        self.compact();
+        self.compact_at = (self.names.len() * 2).max(COMPACT_AT);
+        self.ids.shrink_to_fit();
+        self.words.shrink_to_fit();
+        self.frames.shrink_to_fit();
+        self.present.shrink_to_fit();
+        self.next_present.shrink_to_fit();
     }
 
     /// Forgets the elements nothing kept refers to: not on screen, with no state before the

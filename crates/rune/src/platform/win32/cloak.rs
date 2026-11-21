@@ -8,6 +8,8 @@
 //! thread's text services (TSF), about 7,500 µs on the UI thread, and that would come before the
 //! frame. It shows without activating and activates as the cloak lifts, once its frame is up.
 
+#![allow(unsafe_code)]
+
 use std::cell::Cell;
 use std::time::Instant;
 
@@ -129,12 +131,39 @@ fn set(window: &winit::window::Window, cloaked: bool) -> bool {
 /// Windows refuses also holds the window under the foreground window from then on, so another
 /// process's `HWND_TOPMOST` (PowerToys' Always On Top) succeeds and changes nothing.
 /// `AllowSetForegroundWindow` for this process fails exactly when this process can't take it.
+/// The launch's first window doesn't take the foreground when whoever started the process asked
+/// for a show without activation (`STARTUPINFO`'s `SW_SHOWNOACTIVATE`, `SW_SHOWNA`, a minimized
+/// show), as Windows applies that to a first `ShowWindow`: a script or a test that starts the app
+/// in the background keeps the user's window in front.
 fn activate(window: &winit::window::Window) {
     let Some(hwnd) = super::hwnd(window) else { return };
+    if launch_asks_no_activation() || !take_foreground(hwnd) { return; }
+    crate::marks::mark("window.activated");
+}
+
+/// Brings `hwnd` to the foreground and gives it the focus when this process may take the
+/// foreground, and otherwise leaves it where it is (see `activate`). False when it may not.
+pub(super) fn take_foreground(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
     // SAFETY: plain calls on this process's id and a window this thread owns.
     unsafe {
-        if windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(windows_sys::Win32::System::Threading::GetCurrentProcessId()) == 0 { return; }
+        if windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(windows_sys::Win32::System::Threading::GetCurrentProcessId()) == 0 { return false; }
         windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
     }
-    crate::marks::mark("window.activated");
+    true
+}
+
+/// Whether this is the launch's first activation and the launch asked for none (see `activate`).
+fn launch_asks_no_activation() -> bool {
+    use windows_sys::Win32::System::Threading::{GetStartupInfoW, STARTF_USESHOWWINDOW, STARTUPINFOW};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SW_MINIMIZE, SW_SHOWMINNOACTIVE, SW_SHOWNA, SW_SHOWNOACTIVATE};
+    static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+    if !FIRST.swap(false, std::sync::atomic::Ordering::Relaxed) { return false; }
+    // SAFETY: GetStartupInfoW fills the struct whose size it's given.
+    let info = unsafe {
+        let mut info: STARTUPINFOW = std::mem::zeroed();
+        info.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        GetStartupInfoW(&mut info);
+        info
+    };
+    info.dwFlags & STARTF_USESHOWWINDOW != 0 && [SW_SHOWNOACTIVATE, SW_SHOWNA, SW_SHOWMINNOACTIVE, SW_MINIMIZE].contains(&i32::from(info.wShowWindow))
 }
