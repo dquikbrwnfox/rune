@@ -16,7 +16,7 @@ fn main() { lazy::main() }
 mod lazy {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     use rune::*;
 
     static STARTS: AtomicUsize = AtomicUsize::new(0);
@@ -25,7 +25,7 @@ mod lazy {
     fn hud(_: &(), _: &mut Cx<()>) -> El { el().size(200.0, 40.0).fill(oklcha(0.2, 0.0, 0.0, 0.6)).radius(20.0) }
 
     fn wait(limit: Duration, f: impl Fn() -> bool) -> Option<Duration> {
-        let start = Instant::now();
+        let start = rune::time::now();
         while !f() {
             if start.elapsed() > limit { return None; }
             std::thread::sleep(Duration::from_micros(200));
@@ -56,6 +56,7 @@ mod lazy {
     }
 
     #[cfg(target_os = "windows")]
+    #[allow(unsafe_code)]
     fn private_mb() -> f64 {
         #[repr(C)]
         #[derive(Default)]
@@ -101,7 +102,7 @@ mod lazy {
                     assert_eq!(created.load(Ordering::SeqCst), 0, "a hidden overlay has no window on Windows");
                 } else {
                     wait(Duration::from_secs(10), || full.availability() == Availability::Available).expect("the prewarmed window");
-                    // The GPU probe runs as the event loop starts.
+                    // Let startup make the prewarmed window.
                     std::thread::sleep(Duration::from_millis(1500));
                     assert_eq!(created.load(Ordering::SeqCst), 1, "on_created runs at startup");
                 }

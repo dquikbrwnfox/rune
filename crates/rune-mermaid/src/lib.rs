@@ -103,45 +103,23 @@
 //! [`render_with_hover`] do (they draw everything the frame it mounts), so a diagram settles in
 //! one glide once it has all arrived and doesn't move after.
 
-mod block;
-mod c4;
+#![forbid(unsafe_code)]
+
 mod canvas;
 mod chart;
-mod class;
-mod connector;
-mod date;
-mod er;
-mod flowchart;
-mod gantt;
-mod git;
-mod hover;
-mod ink;
-mod journey;
-mod layered;
-mod layered_draw;
-mod mindmap;
-mod parts;
-mod pie;
-mod quadrant;
-mod requirement;
-mod route;
-mod sankey;
-mod scenes;
+mod graph;
+mod layout;
 mod sequence;
-mod sequence_draw;
-mod shape;
-mod state;
-mod steady;
-mod timeline;
-mod xychart;
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 use rune::{Color, El, TextStyle, oklch, oklcha, tok};
 
-use canvas::Scene;
-pub use hover::Hover;
+use canvas::{Scene, scenes};
+pub use canvas::drawing::DrawingModel;
+pub use canvas::drawing::prepare_drawing;
+pub use canvas::hover::Hover;
 
 /// Colours and type a diagram draws with.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -241,13 +219,33 @@ pub fn render_streamed(src: &str, style: &DiagramStyle, hover: Hover, color: Col
     render_inner(src, style, hover, color, Mode::Settled)
 }
 
+/// A diagram's title and drawing without its card, for a viewer that frames and scales it
+/// itself (a lightbox whose frame stays the card's size while the drawing grows).
+#[non_exhaustive]
+pub struct Drawing {
+    pub el: El,
+    /// The points `el` takes.
+    pub size: [f32; 2],
+    /// The fill and border of the card it would draw in, for the viewer's frame.
+    pub surface: Color,
+    pub surface_border: Color,
+}
+
+/// [`render_with_hover`]'s title and drawing alone, laid out and fitted for `style.max_width`
+/// as its card would be.
+pub fn render_drawing(src: &str, style: &DiagramStyle, hover: Hover, color: Color) -> Option<Drawing> {
+    let hover = (hover != Hover::Off).then_some((hover, color));
+    let (el, size) = scenes::built(src, style, hover, None).0?.drawing(style, None);
+    Some(Drawing { el, size, surface: style.surface, surface_border: style.surface_border })
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     /// Laid out afresh and drawn the frame it mounts.
     Still,
     /// Laid out afresh; what's new comes in on its own.
     Settled,
-    /// Held to the build one line shorter ([`steady`]); what's new comes in on its own.
+    /// Held to the build one line shorter ([`layout::steady`]); what's new comes in on its own.
     Growing,
 }
 
@@ -263,23 +261,23 @@ pub fn supported(src: &str) -> bool {
 }
 
 pub(crate) enum Diagram {
-    Flowchart(flowchart::Flowchart),
+    Flowchart(graph::flowchart::Flowchart),
     Sequence(sequence::Sequence),
-    State(state::StateDiagram),
-    Class(class::ClassDiagram),
-    Er(er::ErDiagram),
-    Gantt(gantt::Gantt),
-    Pie(pie::Pie),
-    Mindmap(mindmap::Mindmap),
-    Timeline(timeline::Timeline),
-    Journey(journey::Journey),
-    Git(git::GitGraph),
-    Quadrant(quadrant::Quadrant),
-    XyChart(xychart::XyChart),
-    Sankey(sankey::Sankey),
-    Block(block::BlockDiagram),
-    Requirement(requirement::Requirements),
-    C4(c4::C4),
+    State(graph::state::StateDiagram),
+    Class(graph::class::ClassDiagram),
+    Er(graph::er::ErDiagram),
+    Gantt(chart::gantt::Gantt),
+    Pie(chart::pie::Pie),
+    Mindmap(chart::mindmap::Mindmap),
+    Timeline(chart::timeline::Timeline),
+    Journey(chart::journey::Journey),
+    Git(chart::git::GitGraph),
+    Quadrant(chart::quadrant::Quadrant),
+    XyChart(chart::xychart::XyChart),
+    Sankey(chart::sankey::Sankey),
+    Block(graph::block::BlockDiagram),
+    Requirement(graph::requirement::Requirements),
+    C4(graph::c4::C4),
 }
 
 pub(crate) struct Parsed {
@@ -311,38 +309,23 @@ const KINDS: &[&str] = &[
 
 /// `src`'s front-matter title, and its lines with their indents, without comments, directives
 /// and front matter.
-fn cleaned(src: &str) -> (Option<String>, std::iter::Peekable<std::vec::IntoIter<(usize, &str)>>) {
-    let mut cleaned = Vec::new();
+fn cleaned(src: &str) -> (Option<String>, impl Iterator<Item = (usize, &str)>) {
     let mut in_directive = false;
-    for raw in src.lines() {
-        let l = raw.trim();
-        if in_directive {
-            if let Some(pos) = l.find("}%%") {
-                in_directive = false;
-                let rest = l[pos + 3..].trim();
-                if !rest.is_empty() && !rest.starts_with("%%") {
-                    cleaned.push((0, rest));
-                }
-            }
-            continue;
-        }
-        if l.starts_with("%%{") {
-            if let Some(pos) = l.find("}%%") {
-                let rest = l[pos + 3..].trim();
-                if !rest.is_empty() && !rest.starts_with("%%") {
-                    cleaned.push((0, rest));
-                }
-            } else {
+    let mut lines = src.lines().filter_map(move |raw| {
+        let line = raw.trim();
+        let (indent, text) = if in_directive || line.starts_with("%%{") {
+            let Some((_, rest)) = line.split_once("}%%") else {
                 in_directive = true;
-            }
-            continue;
-        }
-        if !l.is_empty() && !l.starts_with("%%") {
+                return None;
+            };
+            in_directive = false;
+            (0, rest.trim())
+        } else {
             // Mindmaps nest by indentation.
-            cleaned.push((raw.len() - raw.trim_start().len(), l));
-        }
-    }
-    let mut lines = cleaned.into_iter().peekable();
+            (raw.len() - raw.trim_start().len(), line)
+        };
+        (!text.is_empty() && !text.starts_with("%%")).then_some((indent, text))
+    }).peekable();
     let mut fm_title = None;
     // A front-matter block (`---` … `---`) may carry `title: …` and config.
     if lines.peek().map(|l| l.1) == Some("---") {
@@ -368,23 +351,23 @@ pub(crate) fn parse(src: &str) -> Option<Parsed> {
     let (kind, rest) = header.split_once(|c: char| c.is_whitespace() || c == ';').unwrap_or((header, ""));
     let (indents, body): (Vec<usize>, Vec<&str>) = lines.unzip();
     let (body_title, diagram) = match kind {
-        "graph" | "flowchart" => flowchart::parse(rest, &body).map(|f| (f.title.clone(), Diagram::Flowchart(f)))?,
+        "graph" | "flowchart" => graph::flowchart::parse(rest, &body).map(|f| (f.title.clone(), Diagram::Flowchart(f)))?,
         "sequenceDiagram" => sequence::parse(rest, &body).map(|s| (s.title.clone(), Diagram::Sequence(s)))?,
-        "stateDiagram" | "stateDiagram-v2" => state::parse(rest, &body).map(|s| (s.title.clone(), Diagram::State(s)))?,
-        "classDiagram" => class::parse(rest, &body).map(|c| (c.title.clone(), Diagram::Class(c)))?,
-        "erDiagram" => er::parse(rest, &body).map(|e| (e.title.clone(), Diagram::Er(e)))?,
-        "gantt" => gantt::parse(rest, &body).map(|g| (g.title.clone(), Diagram::Gantt(g)))?,
-        "pie" => pie::parse(rest, &body).map(|p| (p.title.clone(), Diagram::Pie(p)))?,
-        "mindmap" => mindmap::parse(&body, &indents).map(|m| (None, Diagram::Mindmap(m)))?,
-        "timeline" => timeline::parse(rest, &body).map(|t| (t.title.clone(), Diagram::Timeline(t)))?,
-        "journey" => journey::parse(&body).map(|j| (j.title.clone(), Diagram::Journey(j)))?,
-        "gitGraph" | "gitGraph:" => git::parse(rest, &body).map(|g| (None, Diagram::Git(g)))?,
-        "quadrantChart" => quadrant::parse(&body).map(|q| (q.title.clone(), Diagram::Quadrant(q)))?,
-        "xychart-beta" | "xychart" => xychart::parse(rest, &body).map(|x| (x.title.clone(), Diagram::XyChart(x)))?,
-        "sankey-beta" | "sankey" => sankey::parse(&body).map(|s| (None, Diagram::Sankey(s)))?,
-        "block-beta" | "block" => block::parse(&body).map(|b| (None, Diagram::Block(b)))?,
-        "requirementDiagram" => requirement::parse(&body).map(|r| (None, Diagram::Requirement(r)))?,
-        "C4Context" | "C4Container" | "C4Component" | "C4Dynamic" | "C4Deployment" => c4::parse(kind, &body).map(|c| (c.title.clone(), Diagram::C4(c)))?,
+        "stateDiagram" | "stateDiagram-v2" => graph::state::parse(rest, &body).map(|s| (s.title.clone(), Diagram::State(s)))?,
+        "classDiagram" => graph::class::parse(rest, &body).map(|c| (c.title.clone(), Diagram::Class(c)))?,
+        "erDiagram" => graph::er::parse(rest, &body).map(|e| (e.title.clone(), Diagram::Er(e)))?,
+        "gantt" => chart::gantt::parse(rest, &body).map(|g| (g.title.clone(), Diagram::Gantt(g)))?,
+        "pie" => chart::pie::parse(rest, &body).map(|p| (p.title.clone(), Diagram::Pie(p)))?,
+        "mindmap" => chart::mindmap::parse(&body, &indents).map(|m| (None, Diagram::Mindmap(m)))?,
+        "timeline" => chart::timeline::parse(rest, &body).map(|t| (t.title.clone(), Diagram::Timeline(t)))?,
+        "journey" => chart::journey::parse(&body).map(|j| (j.title.clone(), Diagram::Journey(j)))?,
+        "gitGraph" | "gitGraph:" => chart::git::parse(rest, &body).map(|g| (None, Diagram::Git(g)))?,
+        "quadrantChart" => chart::quadrant::parse(&body).map(|q| (q.title.clone(), Diagram::Quadrant(q)))?,
+        "xychart-beta" | "xychart" => chart::xychart::parse(rest, &body).map(|x| (x.title.clone(), Diagram::XyChart(x)))?,
+        "sankey-beta" | "sankey" => chart::sankey::parse(&body).map(|s| (None, Diagram::Sankey(s)))?,
+        "block-beta" | "block" => graph::block::parse(&body).map(|b| (None, Diagram::Block(b)))?,
+        "requirementDiagram" => graph::requirement::parse(&body).map(|r| (None, Diagram::Requirement(r)))?,
+        "C4Context" | "C4Container" | "C4Component" | "C4Dynamic" | "C4Deployment" => graph::c4::parse(kind, &body).map(|c| (c.title.clone(), Diagram::C4(c)))?,
         _ => return None,
     };
     Some(Parsed { title: body_title.or(fm_title), diagram })
@@ -393,23 +376,23 @@ pub(crate) fn parse(src: &str) -> Option<Parsed> {
 pub(crate) fn scene(src: &str, paint: &DiagramStyle, hover: Option<(Hover, Color)>) -> Option<Scene> {
     let parsed = parse(src)?;
     let s = match &parsed.diagram {
-        Diagram::Flowchart(f) => flowchart::draw(f, paint, hover),
+        Diagram::Flowchart(f) => graph::flowchart::draw(f, paint, hover),
         Diagram::Sequence(s) => sequence::draw(s, paint),
-        Diagram::State(s) => state::draw(s, paint, hover),
-        Diagram::Class(c) => class::draw(c, paint, hover),
-        Diagram::Er(e) => er::draw(e, paint, hover),
-        Diagram::Gantt(g) => gantt::draw(g, paint),
-        Diagram::Pie(p) => pie::draw(p, paint),
-        Diagram::Mindmap(m) => mindmap::draw(m, paint),
-        Diagram::Timeline(t) => timeline::draw(t, paint),
-        Diagram::Journey(j) => journey::draw(j, paint),
-        Diagram::Git(g) => git::draw(g, paint),
-        Diagram::Quadrant(q) => quadrant::draw(q, paint),
-        Diagram::XyChart(x) => xychart::draw(x, paint),
-        Diagram::Sankey(s) => sankey::draw(s, paint),
-        Diagram::Block(b) => block::draw(b, paint),
-        Diagram::Requirement(r) => requirement::draw(r, paint, hover),
-        Diagram::C4(c) => c4::draw(c, paint, hover),
+        Diagram::State(s) => graph::state::draw(s, paint, hover),
+        Diagram::Class(c) => graph::class::draw(c, paint, hover),
+        Diagram::Er(e) => graph::er::draw(e, paint, hover),
+        Diagram::Gantt(g) => chart::gantt::draw(g, paint),
+        Diagram::Pie(p) => chart::pie::draw(p, paint),
+        Diagram::Mindmap(m) => chart::mindmap::draw(m, paint),
+        Diagram::Timeline(t) => chart::timeline::draw(t, paint),
+        Diagram::Journey(j) => chart::journey::draw(j, paint),
+        Diagram::Git(g) => chart::git::draw(g, paint),
+        Diagram::Quadrant(q) => chart::quadrant::draw(q, paint),
+        Diagram::XyChart(x) => chart::xychart::draw(x, paint),
+        Diagram::Sankey(s) => chart::sankey::draw(s, paint),
+        Diagram::Block(b) => graph::block::draw(b, paint),
+        Diagram::Requirement(r) => graph::requirement::draw(r, paint, hover),
+        Diagram::C4(c) => graph::c4::draw(c, paint, hover),
     }?;
     Some(s.with_title(parsed.title))
 }
@@ -473,6 +456,8 @@ pub(crate) struct NodeStyle {
     pub fill: Option<Color>,
     pub stroke: Option<Color>,
     pub color: Option<Color>,
+    /// `stroke-width`, in Mermaid's px (one point each).
+    pub width: Option<f32>,
 }
 
 impl NodeStyle {
@@ -481,6 +466,7 @@ impl NodeStyle {
             fill: over.fill.or(self.fill),
             stroke: over.stroke.or(self.stroke),
             color: over.color.or(self.color),
+            width: over.width.or(self.width),
         }
     }
 
@@ -630,10 +616,16 @@ pub(crate) fn parse_style_props(props: &str) -> NodeStyle {
             "fill" => out.fill = parse_color_spec(v),
             "stroke" => out.stroke = parse_color_spec(v),
             "color" => out.color = parse_color_spec(v),
+            "stroke-width" => out.width = px(v).map(|w| w.clamp(0.0, 5.0)),
             _ => {}
         }
     }
     out
+}
+
+/// A CSS length in px (`2px`, `2`).
+fn px(v: &str) -> Option<f32> {
+    v.trim_end_matches("px").trim().parse::<f32>().ok().filter(|w| w.is_finite())
 }
 
 pub(crate) fn parse_edge_style_props(props: &str) -> EdgeStyle {
@@ -643,7 +635,7 @@ pub(crate) fn parse_edge_style_props(props: &str) -> EdgeStyle {
         let v = v.trim().trim_end_matches("!important").trim();
         match k.trim() {
             "stroke" => out.stroke = parse_color_spec(v),
-            "stroke-width" => out.width = v.trim_end_matches("px").trim().parse::<f32>().ok().map(|w| w.clamp(0.75, 5.0)),
+            "stroke-width" => out.width = px(v).map(|w| w.clamp(0.75, 5.0)),
             _ => {}
         }
     }

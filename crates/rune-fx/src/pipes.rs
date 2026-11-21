@@ -9,9 +9,9 @@ use std::sync::OnceLock;
 use crate::FxBlend;
 use crate::pack::KINDS;
 
-const CLIP: &str = include_str!("../../rune/src/clip.wgsl");
-const COMMON: &str = include_str!("shaders/common.wgsl");
-const SOURCES: [(&str, &str); KINDS] = [
+pub(crate) const CLIP: &str = include_str!("../../rune/src/shaders/clip.wgsl");
+pub(crate) const COMMON: &str = include_str!("shaders/common.wgsl");
+pub(crate) const SOURCES: [(&str, &str); KINDS] = [
     ("glow", include_str!("shaders/glow.wgsl")),
     ("pulse", include_str!("shaders/pulse.wgsl")),
     ("electric", include_str!("shaders/electric.wgsl")),
@@ -179,7 +179,7 @@ impl<const N: usize> Passes<N> {
                     multiview_mask: None,
                     cache: None,
                 });
-                let _ = slots[i].set(pipeline);
+                slots[i].set(pipeline).ok();
             });
             slots.map(|s| s.into_inner().expect("built"))
         })
@@ -188,8 +188,14 @@ impl<const N: usize> Passes<N> {
 
 /// Runs `f` on every item, the first on this thread and the rest on their own (Metal compiles
 /// pipelines concurrently), or one after another where there are no threads.
+#[cfg(target_arch = "wasm32")]
+fn in_parallel<T>(items: &[T], f: impl Fn(&T)) {
+    // The web's wgpu device isn't `Sync`, and there are no threads to share it with anyway.
+    items.iter().for_each(f);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn in_parallel<T: Sync>(items: &[T], f: impl Fn(&T) + Sync) {
-    #[cfg(not(target_arch = "wasm32"))]
     if let [first, rest @ ..] = items
         && !rest.is_empty()
     {

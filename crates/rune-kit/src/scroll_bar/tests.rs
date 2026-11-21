@@ -105,6 +105,30 @@ fn dragging_the_thumb_and_pressing_the_track_scroll_the_viewport() {
     assert!(rt.live_only_warnings().is_empty(), "{:#?}", rt.live_only_warnings());
 }
 
+/// A wheel over the bar belongs to the viewport the bar follows, as Chromium's scrollbar belongs
+/// to its scroller: the track draws over the viewport's right edge as its sibling, so it is the
+/// topmost thing a wheel there hits and the viewport is not one of its ancestors.
+#[test]
+fn a_wheel_over_the_bar_scrolls_the_viewport_it_follows() {
+    let mut rt = rune::Runtime::new(20usize, view, (200.0, 100.0), rune::Env::new(true, 1.0));
+    rt.set_system_scroll_bars(ScrollBars::Always);
+    frames(&mut rt, 2);
+    let track = rect(&rt, "scroll-bar");
+    assert_eq!((track[0], track[2]), (186.0, 14.0), "the strip over the viewport's right edge: {track:?}");
+    rt.wheel(track[0] + track[2] / 2.0, 50.0, -40.0);
+    rt.frame(1.0 / 60.0);
+    assert_eq!(top(&rt), -40.0, "a wheel over the track scrolls the viewport it follows");
+
+    let thumb = rect(&rt, "thumb");
+    rt.wheel(thumb[0] + thumb[2] / 2.0, thumb[1] + thumb[3] / 2.0, -40.0);
+    rt.frame(1.0 / 60.0);
+    assert_eq!(top(&rt), -80.0, "and over the thumb in it");
+
+    rt.wheel(60.0, 50.0, -40.0);
+    rt.frame(1.0 / 60.0);
+    assert_eq!(top(&rt), -120.0, "the content left of the bar scrolls as it did");
+}
+
 #[test]
 fn a_track_press_pages_toward_itself_while_held_and_option_jumps() {
     let alt = |rt: &mut rune::Runtime<usize>, down: bool| {
@@ -355,6 +379,39 @@ fn the_thumb_widens_under_the_pointer_and_while_held_without_a_view_run() {
 }
 
 #[test]
+fn a_held_thumb_whose_release_is_lost_narrows_once_the_pointer_moves_on() {
+    fn shown(s: &(usize, bool), _: &mut rune::Cx<(usize, bool)>) -> El {
+        let k = Kit::neutral(true);
+        let area = col()
+            .key("scroll")
+            .w_full()
+            .h(100.0)
+            .scroll(rune::ScrollSpec { stick_bottom: false })
+            .child(col().children((0..s.0).map(|i| el().key(format!("row{i}")).w_full().h(20.0))))
+            .scroll_bar(&k);
+        col().size(200.0, 100.0).children(s.1.then_some(area))
+    }
+    let mut rt = rune::Runtime::new((20usize, true), shown, (200.0, 100.0), rune::Env::new(true, 1.0));
+    rt.set_system_scroll_bars(ScrollBars::Always);
+    frames(&mut rt, 2);
+    rt.pointer_move(195.0, 10.0);
+    rt.pointer_down(195.0, 10.0);
+    rt.pointer_move(100.0, 30.0);
+    frames(&mut rt, 30);
+    assert_eq!(rect(&rt, "thumb")[2], THUMB_HOVER);
+    // The bar goes mid-drag, so its release never reaches it, and comes back.
+    rt.update(|s, _| s.1 = false);
+    frames(&mut rt, 2);
+    rt.pointer_up(100.0, 30.0);
+    rt.update(|s, _| s.1 = true);
+    frames(&mut rt, 30);
+    rt.pointer_move(110.0, 40.0);
+    rt.pointer_move(120.0, 50.0);
+    frames(&mut rt, 30);
+    assert_eq!(rect(&rt, "thumb")[2], THUMB, "the press ended once the pointer moved where the drag didn't hear it");
+}
+
+#[test]
 fn a_styled_thumb_takes_its_colours_and_widths_at_rest_and_under_the_pointer() {
     thread_local! {
         static STYLED_RUNS: Cell<usize> = const { Cell::new(0) };
@@ -542,6 +599,45 @@ fn a_hidden_overlay_thumb_lands_its_new_length_at_once() {
 
 fn thumb_at<S>(rt: &rune::Runtime<S>) -> f32 {
     2.0 + thumb(at(-top(rt), 100.0, 100.0), 96.0).0
+}
+
+#[test]
+fn a_pulse_is_due_at_its_hold_and_fade_summed_before_now() {
+    use super::visibility::{BarState, Effect, Event, Follow, Glide, Opacity, Phase, step};
+    let hold = std::time::Duration::from_millis(750);
+    let follow = |state: &mut BarState, now: f64, scrolled: bool, instant: bool, extent_changed: bool| {
+        step(
+            state,
+            Event::Follow(Follow {
+                shows: true,
+                overlay: true,
+                scrolled,
+                instant,
+                resized: false,
+                lengthened: false,
+                extent_changed,
+                pressed: false,
+                revealed: false,
+                now,
+                hold,
+            }),
+        )
+    };
+    // A wheel scroll at 0.3 s starts the pulse: its hold and fade are summed first, so the
+    // deadline carries that sum's rounding rather than splitting it across `now`.
+    let mut state = BarState::Overlay { phase: Phase::Hidden, glide: Glide::Idle };
+    follow(&mut state, 0.3, true, false, false);
+    assert_eq!(state.pulse_until(), 1.4000000000000001);
+    // An instant content-size change at exactly 1.4 s lands inside it and renews it.
+    let effects = follow(&mut state, 1.4, false, true, true);
+    assert!(
+        effects.into_iter().any(|e| matches!(e, Effect::Opacity(Opacity::Pulse { .. }))),
+        "the pulse renewed"
+    );
+    // Letting go after a hold at 0.3 s gives the same deadline.
+    let mut held = BarState::Overlay { phase: Phase::Held, glide: Glide::Idle };
+    step(&mut held, Event::LetGo { pressed: false, revealed: false, area_reveals: false, now: 0.3, hold });
+    assert_eq!(held.pulse_until(), 1.4000000000000001);
 }
 
 #[test]

@@ -19,6 +19,7 @@ fn experimental(
     cursor: &mut [u32; 3],
     out: &mut Vec<rune::text::GlyphQuad>,
 ) {
+    atlas.data.resize((ATLAS_SIZE * ATLAS_SIZE) as usize, 0);
     use swash::scale::{Render, ScaleContext, Source};
     use swash::zeno::{Format, Vector};
     let mut cx = ScaleContext::new();
@@ -82,6 +83,8 @@ fn experimental(
                     ink: 0,
                     byte: 0,
                     color: 0,
+                    outline: None,
+                    lcd: false,
                 });
                 cursor[0] += p.width + 1;
                 cursor[2] = cursor[2].max(p.height);
@@ -131,8 +134,8 @@ fn main() {
                     tracking: 0.0,
                     ..TextStyle::new(size, 400.0)
                 };
-                if std::env::var("RUNE_TEXT_OPSZ").as_deref() == Ok("point") { style = style.optical_size(size); }
-                if std::env::var("RUNE_TEXT_OPSZ").as_deref() == Ok("legacy") { style = style.optical_sizing(rune::OpticalSize::FontDefault); }
+                if rune::env::var("RUNE_TEXT_OPSZ").as_deref() == Some("point") { style = style.optical_size(size); }
+                if rune::env::var("RUNE_TEXT_OPSZ").as_deref() == Some("legacy") { style = style.optical_sizing(rune::OpticalSize::FontDefault); }
                 let layout = text.layout_rich(string, &[], style, scale, None);
                 if let Some((hint, embolden)) = experiment {
                     experimental(

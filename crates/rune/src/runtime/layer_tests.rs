@@ -89,7 +89,7 @@ fn isolated_layers_match_scalar_overlap_crossfade_and_nesting() {
     for i in &mut instances[..3] { i.clip = [8.0, 5.0, 24.0, 11.0]; }
     renderer.prepare(&gpu.device, &gpu.queue, &mut atlas, &instances, (32, 16));
     assert_eq!(renderer.layer_stats().bytes, 64 * 64 * 8, "clip uses the minimum bucket");
-    assert_eq!(renderer.layers.plan[0].bounds, [8.0, 5.0, 16.0, 6.0]);
+    assert_eq!(renderer.layers.planner.dispositions[0].rect(), [8.0, 5.0, 16.0, 6.0]);
     let out = pixels(&gpu, &renderer, &target);
     near(&out[(8 * 32 + 6) * 4..(8 * 32 + 7) * 4], [0; 4]);
     near(&out[(8 * 32 + 16) * 4..(8 * 32 + 17) * 4], rgba([0.5; 4]));
@@ -107,6 +107,7 @@ fn isolated_layers_match_scalar_overlap_crossfade_and_nesting() {
     ordinary.prepare(&gpu.device, &gpu.queue, &mut atlas, &[rect(bounds, [1.0; 4])], (32, 16));
     assert_eq!(ordinary.layer_stats(), LayerStats::default());
     assert_eq!(ordinary.layers.plan.capacity(), 0);
+    assert_eq!(ordinary.layers.planner.capacities(), [0; 5]);
     assert_eq!(ordinary.layers.targets.capacity(), 0);
     assert_eq!(ordinary.layers.stack.capacity(), 0);
     assert_eq!(ordinary.layers.pipelines.capacity(), 0);
@@ -265,7 +266,7 @@ fn scale_and_fade_reuse_bucket_for_sixty_growing_frames() {
     rt.frame(0.0);
     renderer.prepare(&gpu.device, &gpu.queue, &mut rt.text.atlas, &rt.instances, (256, 256));
     let allocations = renderer.layer_stats().allocations;
-    let first_bounds = renderer.layers.plan[0].bounds;
+    let first_bounds = renderer.layers.planner.dispositions[0].rect();
     assert_eq!(allocations, 1);
     for frame in 1..=60 {
         let t = frame as f32 / 60.0;
@@ -277,7 +278,7 @@ fn scale_and_fade_reuse_bucket_for_sixty_growing_frames() {
         near(&out[(90 * 256 + 90) * 4..(90 * 256 + 91) * 4], rgba([0.1 + 0.8 * t; 4]));
         assert_eq!(renderer.layer_stats().allocations, allocations, "frame {frame}");
     }
-    assert!(renderer.layers.plan[0].bounds[2] > first_bounds[2]);
+    assert!(renderer.layers.planner.dispositions[0].rect()[2] > first_bounds[2]);
     // A genuine shrink drops an oversized allocation, then the tiny minimum bucket stays put.
     for size in [20.0, 19.0, 20.0] {
         let content = group([4.0, 4.0, size, size], 0.5, [1.0; 4]);
@@ -397,12 +398,17 @@ fn clipped_single_draw_fades_do_not_allocate_targets() {
             renderer.prepare_surfaces(&gpu.device, &gpu.queue, &rt.surfaces, (64, 48));
             assert_eq!(renderer.layer_stats().targets, 0, "mode={mode} video={video}");
             let out = pixels(&gpu, &renderer, &target);
-            assert_eq!(out[(24 * 64 + 32) * 4 + 3], 128);
+            // 0.5 * 255 = 127.5 is a rounding tie: D3D12 allows either neighbour (NVIDIA gives 127).
+            assert!(out[(24 * 64 + 32) * 4 + 3].abs_diff(128) <= 1, "mode={mode} video={video}");
             assert_eq!(out[(24 * 64 + 4) * 4 + 3], 0);
             if mode == 1 { assert!(out[(24 * 64 + 8) * 4 + 3] < 32); }
             frames.push(out);
         }
-        assert_eq!(frames[0], frames[1], "primitive and video inherit identical clips/fades");
+        // On D3D12, `shader.wgsl`'s interpolated `i.p` across a viewport-clipped quad can differ
+        // from `video.wgsl`'s `@builtin(position)` by a fraction of a thousandth of a pixel along
+        // a hard clip edge, shifting those boundary pixels by at most 1 LSB.
+        let max_diff = frames[0].iter().zip(&frames[1]).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
+        assert!(max_diff <= 1, "primitive and video inherit identical clips/fades (mode={mode}, max_diff={max_diff})");
     }
 }
 
@@ -440,6 +446,7 @@ fn isolated_layers_preserve_image_video_spring_and_list_order() {
     // A glyph, a vector and a page-1 image inside the nonzero-origin layer. Absolute spring
     // indices differ from local draw indices, so a shifted subrange would use the wrong node.
     let mut atlas = crate::text::TextSystem::default().atlas;
+    atlas.data.resize(crate::text::ATLAS_SIZE.pow(2) as usize, 0);
     atlas.data[0] = 255; atlas.dirty = Some((0, 1));
     content.insert(3, Instance { rect: [9.0, 6.0, 1.0, 1.0], fill: [1.0; 4], clip: NO_CLIP,
         params: [0.0, KIND_GLYPH, 0.0, 1.0], ..Instance::zeroed() });

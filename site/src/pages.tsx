@@ -473,8 +473,8 @@ export function HowItWorksView() {
       <section className="doc-section">
         <SectionHead id="crates" title="Where the code lives">
           <p>
-            The workspace is a few crates. <code>rune</code> holds most of the framework and builds on these
-            foundations.
+            The workspace is layered by responsibility. <code>rune</code> brings together the view tree, runtime,
+            renderer, windows and tooling, and re-exports the crates below it so apps depend on <code>rune</code> alone.
           </p>
         </SectionHead>
         <CrateMap />
@@ -595,7 +595,7 @@ export function LaunchFastView() {
         <SectionHead id="metallib" title="Precompiled Metal shaders">
           <p>
             Without help, a launch translates the uber shader's WGSL to Metal source and has Metal compile it. Rune
-            commits the compiled library instead, as <code>crates/rune/src/uber.metallib</code> (about 33 KB), and on
+            commits the compiled library instead, as <code>crates/rune/src/shaders/uber.metallib</code> (about 33 KB), and on
             macOS loads it through wgpu's passthrough shader support. This skips WGSL parsing, validation, translation
             and Metal's compile on every launch. <code>Renderer::new</code> on a cold shader cache goes from 232 ms to
             85 ms, and from 3.4 ms to 0.6 ms on a warm one. Rune's own Metal backend loads{" "}
@@ -627,14 +627,14 @@ export function LaunchFastView() {
               <strong>"MSL is byte-identical; no Xcode or metallib regeneration needed"</strong> means only the
               fingerprint changed, for example after a comment edit or a descriptor change that generates the same
               Metal. Paste the three <code>pub(super) const</code> lines it prints into{" "}
-              <code>crates/rune/src/render/uber_metallib_hash.rs</code>.
+              <code>crates/rune/src/render/uber/metallib_hash.rs</code>.
             </li>
             <li>
               <strong>"generated MSL or Metal compile flags changed"</strong> or{" "}
               <strong>"does not match recorded hash"</strong> means the library is stale. Run{" "}
               <code>scripts/precompile-metal-shaders.sh</code>. It needs Xcode's Metal toolchain (
               <code>xcrun -sdk macosx metal</code>), dumps the generated MSL, compiles it and rewrites{" "}
-              <code>uber.metallib</code>, <code>uber_native.metallib</code> and <code>uber_metallib_hash.rs</code>.
+              <code>uber.metallib</code>, <code>uber_native.metallib</code> and <code>uber/metallib_hash.rs</code>.
               Commit all three.
             </li>
           </ul>

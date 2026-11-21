@@ -64,23 +64,23 @@ impl TraceChannels {
             if let Some(value) = channel.value {
                 if !channel.described {
                     if !metas.is_empty() { metas.push(','); }
-                    let _ = write!(metas, r#"{{"id":{id},"name":{},"kind":{}"#, json_str(&channel.name), json_str(&channel.kind));
-                    if let Some((owner, unit)) = channel.owner { let _ = write!(metas, r#", "owner":{owner},"unit":{}"#, json_str(unit)); }
+                    write!(metas, r#"{{"id":{id},"name":{},"kind":{}"#, json_str(&channel.name), json_str(&channel.kind)).ok();
+                    if let Some((owner, unit)) = channel.owner { write!(metas, r#", "owner":{owner},"unit":{}"#, json_str(unit)).ok(); }
                     metas.push('}');
                     channel.described = true;
                 }
                 if channel.previous != Some(value) {
                     if !values.is_empty() { values.push(','); }
-                    let _ = write!(values, "[{id},{value}]");
+                    write!(values, "[{id},{value}]").ok();
                 }
             } else if channel.previous.is_some() {
                 if !gone.is_empty() { gone.push(','); }
-                let _ = write!(gone, "{id}");
+                write!(gone, "{id}").ok();
             }
             channel.previous = channel.value;
         }
         for (key, values) in [("cm", metas), ("c", values), ("cg", gone)] {
-            if !values.is_empty() { let _ = write!(line, r#",{key:?}:[{values}]"#); }
+            if !values.is_empty() { write!(line, r#",{key:?}:[{values}]"#).ok(); }
         }
     }
 }
@@ -92,6 +92,9 @@ pub mod flags {
     pub const SCROLLING: u32 = 4;
     pub const CLIPPED: u32 = 8;
     pub const FILTERED: u32 = 16;
+    /// Runs a loop of its own (`El::looping`: a spinner, a sheen, a busy ring's dots), whose
+    /// wraps and turns are its design, however briefly it shows.
+    pub const LOOPING: u32 = 32;
     /// Draws nothing and holds nothing: a hit or hover zone, a spacer.
     pub const BLANK: u32 = 64;
 }
@@ -276,7 +279,7 @@ impl MotionTrace {
         self.last_t = Some(t_ms);
         let mut line = std::mem::take(&mut self.line);
         line.clear();
-        let _ = write!(line, r#"{{"t":{},"n":{},"sc":{}"#, r3(t_ms), n, self.time_scale);
+        write!(line, r#"{{"t":{},"n":{},"sc":{}"#, r3(t_ms), n, self.time_scale).ok();
         if !events.is_empty() || !self.events.is_empty() {
             line.push_str(r#","ev":["#);
             for (k, e) in events.iter().enumerate() {
@@ -309,10 +312,10 @@ impl MotionTrace {
                 }
                 let name = name.map_or_else(|| p.node.0.to_string(), str::to_owned);
                 let (class, host) = namespace.unwrap_or((&self.class, &self.host));
-                let _ = write!(metas, r#"{{"id":{id},"cls":{},"nm":{},"host":{}"#, json_str(class), json_str(&name), json_str(host));
+                write!(metas, r#"{{"id":{id},"cls":{},"nm":{},"host":{}"#, json_str(class), json_str(&name), json_str(host)).ok();
                 if let Some(parent) = p.parent {
                     let pv = self.id(parent);
-                    let _ = write!(metas, r#","pv":{pv}"#);
+                    write!(metas, r#","pv":{pv}"#).ok();
                 }
                 metas.push('}');
             }
@@ -333,7 +336,7 @@ impl MotionTrace {
             if !elems.is_empty() {
                 elems.push(',');
             }
-            let _ = write!(
+            write!(
                 elems,
                 "[{id},{},{},{},{},{},{},{}",
                 r2(r.x),
@@ -343,9 +346,9 @@ impl MotionTrace {
                 r3(p.opacity as f64),
                 r2(p.radius.0[0]),
                 p.flags
-            );
+            ).ok();
             if !s[7].is_nan() {
-                let _ = write!(elems, ",{},{},{},{}", r2(s[7]), r2(s[8]), r2(s[9]), r2(s[10]));
+                write!(elems, ",{},{},{},{}", r2(s[7]), r2(s[8]), r2(s[9]), r2(s[10])).ok();
             }
             elems.push(']');
         }
@@ -357,7 +360,7 @@ impl MotionTrace {
                 if k > 0 {
                     line.push(',');
                 }
-                let _ = write!(
+                write!(
                     line,
                     "[{id},{},{},{},{},{bits},{}]",
                     r2(rect.x),
@@ -365,15 +368,15 @@ impl MotionTrace {
                     r2(rect.w),
                     r2(rect.h),
                     (secs * 1000.0).round()
-                );
+                ).ok();
             }
             line.push(']');
         }
         if !metas.is_empty() {
-            let _ = write!(line, r#","m":[{metas}]"#);
+            write!(line, r#","m":[{metas}]"#).ok();
         }
         if !elems.is_empty() {
-            let _ = write!(line, r#","e":[{elems}]"#);
+            write!(line, r#","e":[{elems}]"#).ok();
         }
         if !gone.is_empty() {
             line.push_str(r#","g":["#);
@@ -383,13 +386,13 @@ impl MotionTrace {
                 if k > 0 {
                     line.push(',');
                 }
-                let _ = write!(line, "{id}");
+                write!(line, "{id}").ok();
             }
             line.push(']');
         }
         self.channels.write_json(&mut line);
         line.push('}');
-        let _ = writeln!(self.out, "{line}");
+        writeln!(self.out, "{line}").ok();
         self.line = line;
     }
 
@@ -400,7 +403,7 @@ impl MotionTrace {
 
 impl Drop for MotionTrace {
     fn drop(&mut self) {
-        let _ = self.out.flush();
+        self.out.flush().ok();
     }
 }
 
@@ -425,7 +428,7 @@ fn json_str(s: &str) -> String {
             '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
             c if (c as u32) < 0x20 => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
+                write!(out, "\\u{:04x}", c as u32).ok();
             }
             c => out.push(c),
         }

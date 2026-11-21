@@ -12,18 +12,22 @@
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 
+use crate::carry::Carry;
 use crate::curve::{Anim, Blend, Curve, Decay, Velocity};
-use crate::layer::{Eps, Kind, Layer};
+use crate::layer::{Kind, Layer};
 use crate::props::{NodeId, Prop, PropClass, PropId};
 use crate::spring::Spring;
 use crate::value::{Animatable, MAX_LANES, lanes};
 
+mod clock;
+mod lanes;
+mod started;
 mod tracks;
 mod typed;
 
+use self::tracks::Mode;
+
 const NONE: u32 = u32::MAX;
-/// Most additive layers a lane keeps before it collapses them into one merged segment.
-const MAX_ADDITIVE: usize = 8;
 
 /// A generational handle to one track.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -163,7 +167,9 @@ pub struct AnimationStore {
     t_meta: Vec<Meta>,
     /// The track's clock: 0 is the store's own, otherwise an index into `clocks`.
     t_clock: Vec<u32>,
-    /// On a stopped clock and already sampled where it holds, so `tick` skips it.
+    /// Sampled at its held pose by the last tick (in whichever [`Mode`] it holds), so `tick`
+    /// can skip it until [`mode`](Self::mode) says it moves. [`resample`](Self::resample)
+    /// clears it wherever a track's timing or pose changes.
     t_held: Vec<bool>,
     track_free: Vec<u32>,
 
@@ -177,6 +183,9 @@ pub struct AnimationStore {
     /// where these are read, and freeing a track never scans them.
     touched: Vec<TrackId>,
     set_touched: Vec<TrackId>,
+    /// Tracks started or retargeted since the last tick, and between the two before (`started`).
+    starts: Vec<TrackId>,
+    ticked_starts: Vec<TrackId>,
 
     extra: Vec<Extra>,
     extra_free: u32,
@@ -186,8 +195,7 @@ pub struct AnimationStore {
     index: FxMap<(u64, u16), u32>,
     node_head: FxMap<u64, u32>,
 
-    events: Vec<MotionEvent>,
-    events_seen: usize,
+    events: Carry<MotionEvent>,
     retarget_audit: Option<RetargetAudit>,
 }
 
@@ -226,14 +234,15 @@ impl AnimationStore {
             active: Vec::new(),
             touched: Vec::new(),
             set_touched: Vec::new(),
+            starts: Vec::new(),
+            ticked_starts: Vec::new(),
             extra: Vec::new(),
             extra_free: NONE,
             pending: Vec::new(),
             pending_free: NONE,
             index: FxMap::default(),
             node_head: FxMap::default(),
-            events: Vec::new(),
-            events_seen: 0,
+            events: Carry::new(),
             retarget_audit: None,
         }
     }
@@ -299,131 +308,6 @@ impl AnimationStore {
         self.tick();
     }
 
-    // ------------------------------------------------------------------------------------------
-    // Per-node time
-
-    /// Runs every track of `node`, and any it creates later, at `scale` times the store's speed:
-    /// each `set_time` advances them by `dt × scale`. At 0 they hold exactly where they are,
-    /// pending delays included, and [`running`](Self::running) ignores them. Changing the scale
-    /// keeps every running animation at its exact place. 1 is the store's own clock.
-    pub fn set_node_time_scale(&mut self, node: NodeId, scale: f32) {
-        let scale = if scale.is_finite() { scale.max(0.0) } else { 1.0 };
-        let old = self.node_clock.get(&node.0).copied().unwrap_or(0);
-        if self.clock_scale(old) == scale {
-            return;
-        }
-        let new = if scale == 1.0 { 0 } else { self.clock_at(scale) };
-        let delta = self.clock_time(new) - self.clock_time(old);
-        if new == 0 {
-            self.node_clock.remove(&node.0);
-        } else {
-            self.clocks[new as usize].nodes += 1;
-            self.node_clock.insert(node.0, new);
-        }
-        let mut t = self.node_head.get(&node.0).copied().unwrap_or(NONE);
-        while t != NONE {
-            self.rebase(t as usize, delta);
-            self.t_clock[t as usize] = new;
-            self.t_held[t as usize] = false;
-            t = self.t_meta[t as usize].node_next;
-        }
-        self.release_clock(old);
-    }
-
-    /// The scale `node`'s tracks run at relative to the store's (1 unless set).
-    pub fn node_time_scale(&self, node: NodeId) -> f32 {
-        if self.node_clock.is_empty() {
-            return 1.0;
-        }
-        self.clock_scale(self.node_clock.get(&node.0).copied().unwrap_or(0))
-    }
-
-    /// The time `node`'s tracks are sampled at: `now()` unless its time is scaled.
-    pub fn node_time(&self, node: NodeId) -> f64 {
-        if self.node_clock.is_empty() {
-            return self.now;
-        }
-        self.clock_time(self.node_clock.get(&node.0).copied().unwrap_or(0))
-    }
-
-    /// The live clock running at `scale`, or a new one reading `now`.
-    fn clock_at(&mut self, scale: f32) -> u32 {
-        if let Some(c) = self.clocks.iter().skip(1).position(|c| c.nodes > 0 && c.scale == scale) {
-            return c as u32 + 1;
-        }
-        if self.clocks.is_empty() {
-            self.clocks.push(SubClock { time: 0.0, scale: 1.0, nodes: 0 });
-        }
-        let clock = SubClock { time: self.now, scale, nodes: 0 };
-        match self.clock_free.pop() {
-            Some(c) => {
-                self.clocks[c as usize] = clock;
-                c
-            }
-            None => {
-                self.clocks.push(clock);
-                self.clocks.len() as u32 - 1
-            }
-        }
-    }
-
-    fn release_clock(&mut self, c: u32) {
-        if c == 0 {
-            return;
-        }
-        let clock = &mut self.clocks[c as usize];
-        clock.nodes -= 1;
-        if clock.nodes == 0 {
-            self.clock_free.push(c);
-        }
-    }
-
-    fn clock_scale(&self, c: u32) -> f32 {
-        if c == 0 { 1.0 } else { self.clocks[c as usize].scale }
-    }
-
-    fn clock_time(&self, c: u32) -> f64 {
-        if c == 0 { self.now } else { self.clocks[c as usize].time }
-    }
-
-    #[inline]
-    pub(crate) fn time_of(&self, t: usize) -> f64 {
-        self.clock_time(self.t_clock[t])
-    }
-
-    #[inline]
-    fn frozen(&self, t: usize) -> bool {
-        let c = self.t_clock[t];
-        c != 0 && self.clocks[c as usize].scale == 0.0
-    }
-
-    /// Shifts every absolute time of track `t` by `delta`.
-    fn rebase(&mut self, t: usize, delta: f64) {
-        if delta == 0.0 {
-            return;
-        }
-        let l0 = self.t_lane0[t] as usize;
-        for l in l0..l0 + self.t_n[t] as usize {
-            self.l_layer[l].t0 += delta;
-            self.l_layer[l].end += delta;
-            let mut m = self.l_more[l];
-            while m != NONE {
-                let e = &mut self.extra[m as usize];
-                e.layer.t0 += delta;
-                e.layer.end += delta;
-                m = e.next;
-            }
-            let mut p = self.l_pending[l];
-            while p != NONE {
-                self.pending[p as usize].at += delta;
-                p = self.pending[p as usize].next;
-            }
-        }
-        self.t_settle_at[t] += delta;
-        self.t_next_due[t] += delta;
-        self.t_meta[t].logical_at += delta;
-    }
-
     /// Device pixels per point; sets settle thresholds below the 1/64 px snap quantum.
     pub fn set_pixel_scale(&mut self, scale: f32) {
         self.pixel_scale = scale.max(1.0);
@@ -448,12 +332,14 @@ impl AnimationStore {
     /// Samples every active track at `now()`, applies due delayed animations, settles finished
     /// tracks. Allocation-free once buffers have grown to the working-set size.
     pub fn tick(&mut self) {
-        self.events.drain(..self.events_seen);
+        self.events.begin();
         self.touched.clear();
         let meta = &self.t_meta;
         let live = |id: &&TrackId| meta[id.index as usize].alive && meta[id.index as usize].generation == id.generation;
         self.touched.extend(self.set_touched.iter().filter(live));
         self.set_touched.clear();
+        std::mem::swap(&mut self.starts, &mut self.ticked_starts);
+        self.starts.clear();
         let clocked = !self.node_clock.is_empty();
         let mut i = 0;
         while i < self.active.len() {
@@ -461,16 +347,16 @@ impl AnimationStore {
             let now = if clocked { self.time_of(t) } else { self.now };
             // Nothing moves on a stopped clock, or on a track that only waits for a delayed
             // start: once sampled where it holds, it isn't touched again until it moves.
-            let held = (clocked && self.frozen(t)) || (now >= self.t_settle_at[t] && self.t_next_due[t] > now);
-            if held && self.t_held[t] {
+            let mode = self.mode(t);
+            if mode.holds() && self.t_held[t] {
                 i += 1;
                 continue;
             }
-            self.t_held[t] = held;
             self.touched.push(TrackId { index: t as u32, generation: self.t_meta[t].generation });
             if self.t_next_due[t] <= now {
                 self.apply_due(t, now);
             }
+            self.t_held[t] = mode.holds();
             let l0 = self.t_lane0[t] as usize;
             let n = self.t_n[t] as usize;
             let range = l0..l0 + n;
@@ -505,12 +391,12 @@ impl AnimationStore {
             }
             i += 1;
         }
-        self.events_seen = self.events.len();
+        self.events.end();
     }
 
     /// Events since the previous tick (settles, completions).
     pub fn events(&self) -> &[MotionEvent] {
-        &self.events
+        self.events.as_slice()
     }
 
     /// The values presented at the last tick for a track, as raw lanes.
@@ -562,7 +448,7 @@ impl AnimationStore {
         if self.node_clock.is_empty() {
             return !self.active.is_empty();
         }
-        self.active.iter().any(|&t| !self.frozen(t as usize))
+        self.active.iter().any(|&t| !matches!(self.mode(t as usize), Mode::Frozen))
     }
 
     pub fn track_len(&self) -> usize {
@@ -614,7 +500,7 @@ impl AnimationStore {
                 self.t_next_due[t] = f64::INFINITY;
                 self.t_slot[t] = NONE;
                 self.t_clock[t] = clock;
-                self.t_held[t] = false;
+                self.resample(t);
                 t as u32
             }
             None => {
@@ -744,331 +630,6 @@ impl AnimationStore {
             }
         }
         changed
-    }
-
-    /// Starts a new segment on lane `l` at time `at` from its exact state there.
-    #[allow(clippy::too_many_arguments)]
-    fn start_lane(&mut self, l: usize, at: f64, target: f32, curve: Curve, blend: Blend, vel: Option<f32>, eps: Eps) {
-        let (x, v) = self.sample_lane(l, at);
-        self.l_curve[l] = curve;
-        match curve {
-            Curve::Instant => {
-                self.free_extra(l);
-                self.l_layer[l] = Layer::REST;
-                self.l_target[l] = target;
-            }
-            Curve::Decay(d) => {
-                let v = vel.unwrap_or(v);
-                self.free_extra(l);
-                self.l_target[l] = x + v / d.k();
-                self.l_layer[l] = Layer::decay(d.k(), at, v, eps);
-            }
-            _ if blend == Blend::Additive => {
-                let old = self.l_target[l];
-                self.l_target[l] = target;
-                let layer = Layer::start(&curve, at, old - target, vel.map_or(0.0, |u| u - v), eps);
-                self.push_layer(l, layer, at);
-            }
-            _ => {
-                self.free_extra(l);
-                self.l_target[l] = target;
-                self.l_layer[l] = Layer::start(&curve, at, x - target, vel.unwrap_or(v), eps);
-            }
-        }
-    }
-
-    fn push_layer(&mut self, l: usize, layer: Layer, at: f64) {
-        if layer.kind == Kind::Rest {
-            return;
-        }
-        if self.l_layer[l].kind == Kind::Rest || self.l_layer[l].end <= at {
-            self.l_layer[l] = layer;
-            return;
-        }
-        let mut count = 1;
-        let mut m = self.l_more[l];
-        while m != NONE {
-            count += 1;
-            m = self.extra[m as usize].next;
-        }
-        if count >= MAX_ADDITIVE {
-            // Too many stacked layers: collapse into one merged segment on the new curve. Exact in
-            // position and velocity at `at`.
-            // The lane's target already moved; the new layer carries the difference.
-            let (x, v) = self.sample_lane(l, at);
-            let (o, ov) = layer.sample(at);
-            let (x, v) = (x + o, v + ov);
-            self.free_extra(l);
-            let target = self.l_target[l];
-            let curve = self.l_curve[l];
-            self.l_layer[l] = Layer::start(&curve, at, x - target, v, Eps { pos: 1e-4, vel: 1e-3 });
-            return;
-        }
-        let idx = self.alloc_extra(Extra { layer, next: self.l_more[l] });
-        self.l_more[l] = idx;
-    }
-
-    #[inline]
-    fn sample_lane(&self, l: usize, at: f64) -> (f32, f32) {
-        let (mut o, mut v) = self.l_layer[l].sample(at);
-        let mut m = self.l_more[l];
-        while m != NONE {
-            let e = &self.extra[m as usize];
-            let (a, b) = e.layer.sample(at);
-            o += a;
-            v += b;
-            m = e.next;
-        }
-        (self.l_target[l] + o, v)
-    }
-
-    /// Sums extra layers and frees the ones that have ended.
-    fn sample_extra(&mut self, l: usize, now: f64) -> (f32, f32) {
-        let (mut o, mut v) = (0.0, 0.0);
-        let mut prev = NONE;
-        let mut m = self.l_more[l];
-        while m != NONE {
-            let e = self.extra[m as usize];
-            if now >= e.layer.end {
-                if prev == NONE {
-                    self.l_more[l] = e.next;
-                } else {
-                    self.extra[prev as usize].next = e.next;
-                }
-                self.extra[m as usize].next = self.extra_free;
-                self.extra_free = m;
-            } else {
-                let (a, b) = e.layer.sample(now);
-                o += a;
-                v += b;
-                prev = m;
-            }
-            m = e.next;
-        }
-        (o, v)
-    }
-
-    fn final_target(&self, l: usize) -> f32 {
-        let mut p = self.l_pending[l];
-        let mut target = self.l_target[l];
-        while p != NONE {
-            target = self.pending[p as usize].target;
-            p = self.pending[p as usize].next;
-        }
-        target
-    }
-
-    fn apply_due(&mut self, t: usize, now: f64) {
-        let l0 = self.t_lane0[t] as usize;
-        let n = self.t_n[t] as usize;
-        let eps = self.t_meta[t].class.eps(self.pixel_scale);
-        for l in l0..l0 + n {
-            loop {
-                let p = self.l_pending[l];
-                if p == NONE || self.pending[p as usize].at > now {
-                    break;
-                }
-                let ev = self.pending[p as usize];
-                self.l_pending[l] = ev.next;
-                self.pending[p as usize].next = self.pending_free;
-                self.pending_free = p;
-                let vel = if ev.velocity.is_nan() { None } else { Some(ev.velocity) };
-                self.start_lane(l, ev.at, ev.target, ev.curve, ev.blend, vel, eps);
-            }
-        }
-        self.recompute(t);
-    }
-
-    /// Recomputes the track's next due time and settle time from its lanes.
-    fn recompute(&mut self, t: usize) {
-        let l0 = self.t_lane0[t] as usize;
-        let n = self.t_n[t] as usize;
-        let mut due = f64::INFINITY;
-        let mut settle = f64::NEG_INFINITY;
-        for l in l0..l0 + n {
-            let p = self.l_pending[l];
-            if p != NONE {
-                due = due.min(self.pending[p as usize].at);
-            }
-            if self.l_layer[l].kind != Kind::Rest {
-                settle = settle.max(self.l_layer[l].end);
-            }
-            let mut m = self.l_more[l];
-            while m != NONE {
-                settle = settle.max(self.extra[m as usize].layer.end);
-                m = self.extra[m as usize].next;
-            }
-        }
-        self.t_next_due[t] = due;
-        self.t_settle_at[t] = settle;
-    }
-
-    fn settle(&mut self, t: usize) {
-        let l0 = self.t_lane0[t] as usize;
-        let n = self.t_n[t] as usize;
-        for l in l0..l0 + n {
-            self.free_extra(l);
-            self.l_layer[l] = Layer::REST;
-            self.l_value[l] = self.l_target[l];
-            self.l_vel[l] = 0.0;
-        }
-        let m = self.t_meta[t];
-        self.events.push(MotionEvent::Settled { track: self.id_of(t), node: m.node, prop: m.prop });
-        self.take_token(t, true);
-    }
-
-    fn take_token(&mut self, t: usize, finished: bool) {
-        let m = &mut self.t_meta[t];
-        if m.token != 0 {
-            let token = core::mem::take(&mut m.token);
-            let (node, prop) = (m.node, m.prop);
-            self.events.push(MotionEvent::Completed { token, node, prop, finished });
-        }
-    }
-
-    fn activate(&mut self, t: usize) {
-        if self.t_slot[t] == NONE {
-            self.t_slot[t] = self.active.len() as u32;
-            self.active.push(t as u32);
-        }
-    }
-
-    fn deactivate(&mut self, t: usize, slot: usize) {
-        self.active.swap_remove(slot);
-        if slot < self.active.len() {
-            let moved = self.active[slot] as usize;
-            self.t_slot[moved] = slot as u32;
-        }
-        self.t_slot[t] = NONE;
-    }
-
-    fn push_pending(&mut self, l: usize, mut ev: Pending) {
-        // Keep the lane's list sorted by time.
-        let mut prev = NONE;
-        let mut cur = self.l_pending[l];
-        while cur != NONE && self.pending[cur as usize].at <= ev.at {
-            prev = cur;
-            cur = self.pending[cur as usize].next;
-        }
-        ev.next = cur;
-        let idx = if self.pending_free != NONE {
-            let i = self.pending_free;
-            self.pending_free = self.pending[i as usize].next;
-            self.pending[i as usize] = ev;
-            i
-        } else {
-            self.pending.push(ev);
-            (self.pending.len() - 1) as u32
-        };
-        if prev == NONE {
-            self.l_pending[l] = idx;
-        } else {
-            self.pending[prev as usize].next = idx;
-        }
-    }
-
-    #[allow(clippy::too_many_arguments, reason = "Internal lane scheduler takes a track/lane address and the pending animation fields")]
-    pub(crate) fn schedule(&mut self, t: usize, lane: usize, at: f64, target: f32, curve: Curve, blend: Blend, velocity: Option<f32>) {
-        let l = self.t_lane0[t] as usize + lane;
-        self.push_pending(l, Pending { at, target, velocity: velocity.unwrap_or(f32::NAN), curve, blend, next: NONE });
-    }
-
-    pub(crate) fn cancel_track_pending(&mut self, t: usize) {
-        let l0 = self.t_lane0[t] as usize;
-        for l in l0..l0 + self.t_n[t] as usize {
-            self.cancel_pending(l);
-        }
-    }
-
-    /// After `schedule` calls: recompute timing and wake the track.
-    pub(crate) fn commit_scheduled(&mut self, t: usize, logical_at: f64, token: u64) {
-        self.take_token(t, false);
-        let m = &mut self.t_meta[t];
-        m.token = token;
-        m.logical_at = logical_at;
-        m.epoch = m.epoch.wrapping_add(1);
-        self.t_held[t] = false;
-        self.recompute(t);
-        self.activate(t);
-    }
-
-    fn cancel_pending(&mut self, l: usize) {
-        let mut p = self.l_pending[l];
-        while p != NONE {
-            let next = self.pending[p as usize].next;
-            self.pending[p as usize].next = self.pending_free;
-            self.pending_free = p;
-            p = next;
-        }
-        self.l_pending[l] = NONE;
-    }
-
-    fn alloc_extra(&mut self, e: Extra) -> u32 {
-        if self.extra_free != NONE {
-            let i = self.extra_free;
-            self.extra_free = self.extra[i as usize].next;
-            self.extra[i as usize] = e;
-            i
-        } else {
-            self.extra.push(e);
-            (self.extra.len() - 1) as u32
-        }
-    }
-
-    fn free_extra(&mut self, l: usize) {
-        let mut m = self.l_more[l];
-        while m != NONE {
-            let next = self.extra[m as usize].next;
-            self.extra[m as usize].next = self.extra_free;
-            self.extra_free = m;
-            m = next;
-        }
-        self.l_more[l] = NONE;
-    }
-
-    fn unlink_node(&mut self, node: NodeId, t: u32) {
-        let head = self.node_head.get(&node.0).copied().unwrap_or(NONE);
-        if head == t {
-            let next = self.t_meta[t as usize].node_next;
-            if next == NONE {
-                self.node_head.remove(&node.0);
-            } else {
-                self.node_head.insert(node.0, next);
-            }
-            return;
-        }
-        let mut cur = head;
-        while cur != NONE {
-            let next = self.t_meta[cur as usize].node_next;
-            if next == t {
-                self.t_meta[cur as usize].node_next = self.t_meta[t as usize].node_next;
-                return;
-            }
-            cur = next;
-        }
-    }
-
-    fn free_track(&mut self, t: usize) {
-        if !self.t_meta[t].alive {
-            return;
-        }
-        let l0 = self.t_lane0[t] as usize;
-        let n = self.t_n[t] as usize;
-        for l in l0..l0 + n {
-            self.cancel_pending(l);
-            self.free_extra(l);
-        }
-        if self.t_slot[t] != NONE {
-            let slot = self.t_slot[t] as usize;
-            self.deactivate(t, slot);
-        }
-        let m = self.t_meta[t];
-        self.index.remove(&(m.node.0, m.prop.0));
-        self.lane_free[n].push(l0 as u32);
-        // Removal cancels the animation: whoever waits on its completion hears so.
-        self.take_token(t, false);
-        self.t_meta[t].alive = false;
-        self.track_free.push(t as u32);
     }
 }
 

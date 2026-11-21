@@ -263,7 +263,7 @@ Shift and Cmd. `filter(|n| ..)` keeps the folders that lead to a match open. `re
 opens, selects and scrolls to a row, so a tree can follow an editor or a diff. Rows report
 `treeitem` with their level, open state and selection. 50,000 files scroll at 0.4 ms a frame
 (p50) and 4 ms when rows mount (p95); building the model takes about 35 ms
-(`cargo test --profile perf -p rune-kit --test tree -- --ignored --nocapture`).
+(`cargo test --profile perf -p rune-kit --test integration tree:: -- --ignored --nocapture`).
 [Light](../../demo/kit/tree-light.png) and [dark](../../demo/kit/tree-dark.png) stills:
 `cargo run -p rune-kit --example tree`.
 
@@ -276,7 +276,7 @@ shows the direction. Cells come from `cell(|s, i, column| Cell::text(..))`; text
 shows its whole text as a tooltip. `zebra(true)` stripes rows. The keys are the arrows, Page
 Up and Down, Home, End, Return (`on_open`), and in a multi-select table Shift and Cmd-A. Roles
 are `grid`, `row`, `columnheader` and `gridcell`. 100,000 rows scroll at 0.4 ms a frame (p50)
-and 3.4 ms when rows mount (p95) (`--test table`).
+and 3.4 ms when rows mount (p95) (`--test integration table::`).
 [Light](../../demo/kit/table-light.png) and [dark](../../demo/kit/table-dark.png) stills:
 `cargo run -p rune-kit --example table`. `MarkdownStyle::table_like(&TableStyle::from_kit(k))`
 draws Markdown tables with the same font, padding and rules.
@@ -317,9 +317,13 @@ source each time, and earlier blocks stay mounted.
 - **The same highlighting outside Markdown.** `rune_kit::syntax` doesn't need the `markdown`
   feature: `syntax::highlight(Some("rust"), code)` returns the cached ranges and
   `SyntaxTheme::from_kit(&k).spans(&ranges, offset)` turns them into colour-only `Span`s for
-  any rich text, such as code in a composer. Each built-in language is a small hand-written
-  scanner that runs in linear time (under 0.5 ms per thousand lines); a block colours its first
-  32 KiB (or 8192 ranges) and draws the rest plain, so a 10,000-line block never stalls a frame.
+  any rich text, such as code in a composer. The built-in highlighter is OpenCode Desktop's own:
+  Pierre's Highlights, 80 hand-written lexers (C, C++, C#, Java, Kotlin, Ruby, PHP, Lua,
+  Dockerfile, Makefile and the rest) that `rune-highlights` translates from WebAssembly to Rust
+  at build time, so tokens match Desktop's exactly. They run in linear time (0.1 to 0.6 ms per
+  thousand lines); a block streaming in costs only its new lines; a block colours its first
+  128 KiB (or 32,768 ranges) and draws the rest plain. `syntax::lang_for_path` names a file's
+  language as Desktop's diffs do.
 - **```` ```diff ````** (or `patch`) fences tint `+` and `-` lines edge to edge, and dim `@@`
   and file header lines. Set colours with `MarkdownStyle::diff` and `diff_hunk`. Line text
   keeps the body colour unless `diff_text(added, removed)` or `diff_text_tint(0.5)` (toward the
@@ -350,7 +354,8 @@ the delayed, self-dismissing system tooltip when the look needn't match. The gal
 `rune_kit::diff` shows code changes for review. `diff::parse(patch)` reads `git diff` output
 (several files, renames with similarity, mode changes, binary files, `\ No newline at end of
 file`, quoted paths) and `FileDiff::from_texts(path, old, new)` diffs two texts (Myers, line
-by line). Changed lines that pair up get word-level changes. The app keeps a `DiffState` in
+by line, three lines of context; `from_texts_with_context` keeps another count). Changed lines
+that pair up get word-level changes. The app keeps a `DiffState` in
 its state and draws it with `DiffView`:
 
 ```rust
@@ -389,7 +394,7 @@ DiffView::new(|s: &App| &s.diff, |s: &mut App| &mut s.diff)
 - **Long diffs** are a virtual list built by index, so a commit costs the rows in view, not
   the length: two 50,000-line texts diff in about 40 ms, the first frame takes about 20 ms,
   and a commit takes as long as a 300-line diff's. `cargo test -p rune-kit --profile perf
-  --test diff diff_50k_time -- --ignored --nocapture` measures it.
+  --test integration diff::diff_50k_time -- --ignored --nocapture` measures it.
 
 `cargo run -p rune-kit --example diff` shows a five-file review with a comment and a folded
 range; stills: [unified](../../demo/kit/diff-unified-light.png) and

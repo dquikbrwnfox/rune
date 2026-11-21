@@ -19,10 +19,10 @@ fn spans_with(src: &str, style: &MarkdownStyle, highlighter: Highlighter) -> Vec
         }
     }
     let (blocks, sources, tasks, _, _) = doc_cached(src);
-    let r = Renderer { s: style.clone(), highlights: Vec::new(), reveal: 0.0, streaming: false, on_link: None, on_link_secondary: None, link_look: None, link_help: None, link_ring: None, on_task: None,
-        tasks_read_only: false, selectable: false, scroll_wide: false, highlighter, sources: sources.clone(),
+    let r = Renderer { s: style.clone(), highlights: Vec::new(), reveal: 0.0, streaming: false, on_link: None, on_link_secondary: None, link_look: None, link_help: None, link_ring: None, code_link: None, on_task: None,
+        tasks_read_only: false, selectable: false, scroll_wide: false, tentative: None, highlighter, sources: sources.clone(),
         next_source: Cell::new(0), tasks, next_task: Cell::new(0), current_block_key: RefCell::new("b0".into()),
-        #[cfg(feature = "mermaid")] diagram_frame: None, code_frame: None, flow: Cell::default() };
+        #[cfg(feature = "mermaid")] diagram_frame: None, code_frame: None, quote_frame: None, link_favicon: None, images: None, on_image: None, flow: Cell::default() };
     let mut found = Vec::new();
     codes(&blocks, &mut found);
     assert_eq!(found.len(), sources.len(), "one source per code block");
@@ -47,14 +47,14 @@ fn known_languages_are_coloured_and_others_stay_plain() {
     let got = spans(src, &style);
     assert_eq!(got.len(), 6);
     let (ts, s) = &got[0];
-    assert_eq!(coloured(ts, s, style.syntax.color(Syntax::Keyword)), ["const"]);
+    assert_eq!(coloured(ts, s, style.syntax.color(Syntax::Keyword)), ["const "]);
     assert_eq!(coloured(ts, s, style.syntax.color(Syntax::Number)), ["1"]);
     assert!(s.iter().all(|s| s.color.is_some() && s.weight.is_none() && !s.italic && !s.mono && s.size.is_none() && s.bg.is_none()));
     for (code, s) in &got[1..4] {
         assert!(s.is_empty(), "{code:?} stays plain");
     }
     assert_eq!(coloured(&got[4].0, &got[4].1, style.syntax.color(Syntax::Function)), ["f"]);
-    assert_eq!(coloured(&got[5].0, &got[5].1, style.syntax.color(Syntax::Keyword)), ["select"]);
+    assert_eq!(coloured(&got[5].0, &got[5].1, style.syntax.color(Syntax::Keyword)), ["select "]);
 }
 
 #[test]
@@ -73,7 +73,7 @@ fn syntax_builders_override_and_switch_off_colour() {
     let src = "```rust\nlet x = 1;\n```";
     let style = MarkdownStyle::neutral(true).syntax(Syntax::Keyword, red);
     let (code, s) = &spans(src, &style)[0];
-    assert_eq!(coloured(code, s, red), ["let"]);
+    assert_eq!(coloured(code, s, red), ["let "]);
     assert!(spans(src, &style.syntax_highlight(false))[0].1.is_empty());
 }
 
@@ -102,11 +102,11 @@ fn a_highlighter_gets_each_fence_language_as_written() {
 #[test]
 fn without_a_highlighter_the_output_is_the_builtin_ones() {
     let style = MarkdownStyle::neutral(false);
-    let src = "```ts\nconst a = 1;\n```\n\n```\nplain\n```\n\n```kotlin\nval x = 1\n```";
+    let src = "```ts\nconst a = 1;\n```\n\n```\nplain\n```\n\n```cobol\nMOVE 1 TO X\n```";
     let got = spans(src, &style);
     let k = |s| style.syntax.color(s);
     let ts: Vec<_> = got[0].1.iter().map(|s| (s.start, s.end, s.color.unwrap())).collect();
-    assert_eq!(ts, [(0, 5, k(Syntax::Keyword)), (8, 9, k(Syntax::Punctuation)), (10, 11, k(Syntax::Number)), (11, 12, k(Syntax::Punctuation))]);
+    assert_eq!(ts, [(0, 6, k(Syntax::Keyword)), (6, 8, k(Syntax::Variable)), (8, 10, k(Syntax::Operator)), (10, 11, k(Syntax::Number)), (11, 12, k(Syntax::Punctuation))]);
     assert!(got[1].1.is_empty() && got[2].1.is_empty());
     let h = Highlighter::new(|_, _| panic!("colour is off"));
     assert!(spans_with(src, &style.clone().syntax_highlight(false), h).iter().all(|(_, s)| s.is_empty()));
@@ -272,11 +272,11 @@ fn link_spans_come_before_inner_inline_styles_so_bold_em_and_code_keep_theirs() 
     });
     let (blocks, sources, tasks, _, _) = doc_cached("[**bold** *em* `code` plain](session:1)");
     let Block::Para(inl) = &blocks[0] else { panic!() };
-    let r = Renderer { s: style.clone(), highlights: Vec::new(), reveal: 0.0, streaming: false, on_link: None, on_link_secondary: None, link_look: Some(look), link_help: None, link_ring: None, on_task: None,
-        tasks_read_only: false, selectable: false, scroll_wide: false, highlighter: Highlighter::builtin(), sources,
+    let r = Renderer { s: style.clone(), highlights: Vec::new(), reveal: 0.0, streaming: false, on_link: None, on_link_secondary: None, link_look: Some(look), link_help: None, link_ring: None, code_link: None, on_task: None,
+        tasks_read_only: false, selectable: false, scroll_wide: false, tentative: None, highlighter: Highlighter::builtin(), sources,
         next_source: Cell::new(0), tasks, next_task: Cell::new(0), current_block_key: RefCell::new("b0".into()),
-        #[cfg(feature = "mermaid")] diagram_frame: None, code_frame: None, flow: Cell::default() };
-    let spans = r.spans(inl, style.body.size);
+        #[cfg(feature = "mermaid")] diagram_frame: None, code_frame: None, quote_frame: None, link_favicon: None, images: None, on_image: None, flow: Cell::default() };
+    let spans = r.spans(inl, style.body);
     // The link span is first so `flatten_spans` applies inner Strong/Em/Code over it.
     assert_eq!((spans[0].start, spans[0].end, spans[0].color, spans[0].weight, spans[0].bg, spans[0].bg_pad), (0, inl.text.len() as u32, Some(Color::WHITE), Some(500.0), Some(bg), 3.0));
     assert!(spans.iter().any(|s| &inl.text[s.start as usize..s.end as usize] == "bold" && s.weight == Some(style.strong_weight)));
@@ -378,4 +378,69 @@ fn link_help_gives_each_link_its_own_tooltip() {
         (Some("https://example.com/docs".into()), Some("example.com/docs".into())),
         (Some("notes".into()), None),
     ]);
+}
+
+/// A wheel over a wide table's scroll bar scrolls the pane around that table, though every wide
+/// table keys its viewport `scroll` (`table::Renderer::wide_frame`): the wheel names the viewport
+/// in the pane that holds the bar, not the first element keyed alike in the window, and a
+/// sideways table's own bar hands a vertical wheel to the pane as it did before the bar existed.
+#[test]
+fn a_wheel_over_a_table_s_scroll_bar_scrolls_its_own_pane() {
+    use std::cell::Cell;
+    use rune::{Cx, Env, Runtime, ScrollPos, ScrollSpec};
+    thread_local! {
+        static LEFT: Cell<f32> = const { Cell::new(0.0) };
+        static RIGHT: Cell<f32> = const { Cell::new(0.0) };
+    }
+    const DOC: &str = "| one | two | three |
+| --- | --- | --- |
+| alpha beta gamma delta | epsilon zeta eta theta | iota kappa lambda mu |
+| aaaa bbbb cccc dddd | eeee ffff gggg hhhh | iiii jjjj kkkk llll |
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor.
+
+Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi.
+
+Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore.
+
+Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia.
+
+Sed ut perspiciatis unde omnis iste natus error sit voluptatem accusantium.
+
+Nemo enim ipsam voluptatem quia voluptas sit aspernatur aut odit aut fugit.
+
+Neque porro quisquam est, qui dolorem ipsum quia dolor sit amet, consectetur.
+
+Ut enim ad minima veniam, quis nostrum exercitationem ullam corporis suscipit.
+
+Quis autem vel eum iure reprehenderit qui in ea voluptate velit esse quam.";
+
+    fn panes(_: &(), _: &mut Cx<()>) -> El {
+        let style = MarkdownStyle::neutral(true).text_width(120.0).table_scroll_bar(Color::BLACK, Color::BLACK);
+        let pane = |key: &str, at: fn(ScrollPos)| col().key(key.to_owned()).w(200.0).h(400.0)
+            .child(col().key("list").w_full().h_full().scroll(ScrollSpec { stick_bottom: false })
+                .on_scroll_offset(at)
+                .child(Markdown::new(DOC).scroll_wide(true).render(&style)));
+        row().key("root").w_full().h_full()
+            .child(pane("left", |p| LEFT.with(|c| c.set(p.offset[1]))))
+            .child(pane("right", |p| RIGHT.with(|c| c.set(p.offset[1]))))
+    }
+    let mut rt = Runtime::new((), panes, (400.0, 400.0), Env::new(true, 1.0));
+    let (left, right) = (|| LEFT.with(Cell::get), || RIGHT.with(Cell::get));
+    rt.frame(0.0);
+    // The right pane's table bar: the strip under its rows, in the pane that holds it.
+    let bars = |rt: &Runtime<()>| -> Vec<([f32; 4], f32)> {
+        rt.elements().into_iter().filter(|e| e.key.as_deref() == Some("scroll-bar")).map(|e| (e.rect, e.opacity)).collect()
+    };
+    let bar = bars(&rt).iter().filter(|(r, _)| r[0] > 200.0).max_by(|a, b| a.0[0].total_cmp(&b.0[0]))
+        .map(|(r, _)| *r).unwrap_or_else(|| panic!("both tables scroll sideways: {:?}", bars(&rt)));
+    // An overlay bar shows while the pointer is over its table, which is when a wheel there
+    // reaches its track at all.
+    rt.pointer_move(bar[0] + bar[2] / 2.0, bar[1] + bar[3] / 2.0);
+    for _ in 0..30 { rt.frame(1.0 / 60.0); }
+    assert!(bars(&rt).iter().all(|(_, o)| *o > 0.9), "the bars are up under the pointer: {:?}", bars(&rt));
+    rt.wheel(bar[0] + bar[2] / 2.0, bar[1] + bar[3] / 2.0, -30.0);
+    rt.frame(1.0 / 60.0);
+    assert_eq!(right(), 30.0, "the wheel over the right pane's table bar scrolled its own pane");
+    assert_eq!(left(), 0.0, "the left pane, keyed alike, stayed where it was");
 }

@@ -230,7 +230,7 @@ fn a_bundle_holds_a_trace_a_contact_sheet_and_a_summary() {
     frames(&mut rt, 10);
     let clip = rt.state.rewind.freeze();
     let dir = std::env::temp_dir().join(format!("rune-rewind-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::remove_dir_all(&dir).ok();
     let bundle = clip.write_bundle(&dir, 0..clip.len(), "the title hops").unwrap();
     let trace = std::fs::read_to_string(dir.join("trace.jsonl")).unwrap();
     let mut lines = trace.lines();
@@ -245,5 +245,28 @@ fn a_bundle_holds_a_trace_a_contact_sheet_and_a_summary() {
     assert_eq!(summary, bundle.summary());
     assert!(summary.contains("> the title hops"));
     assert!(summary.contains("## Jumps") && summary.contains("title ↓7.5 pt"), "{summary}");
-    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Opening the scrubber over another recorder resumes the one it froze before; showing a saved
+/// clip keeps the frozen one until the scrubber closes.
+#[test]
+fn opening_over_an_open_scrubber_resumes_the_recorder_it_froze() {
+    let (first, second) = (Rewind::new(), Rewind::new());
+    let mut scrub = Scrub::default();
+    scrub.open(&first);
+    scrub.open(&second);
+    assert!(!first.is_paused(), "the first recorder records again");
+    assert!(second.is_paused());
+    scrub.show(first.freeze());
+    first.resume();
+    assert!(second.is_paused(), "a story over it keeps it frozen");
+    scrub.close();
+    assert!(!scrub.is_open() && !second.is_paused());
+    // Reopening the same recorder leaves it frozen.
+    scrub.open(&first);
+    scrub.open(&first);
+    assert!(first.is_paused());
+    scrub.close();
+    assert!(!first.is_paused());
 }

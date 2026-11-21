@@ -12,8 +12,16 @@
 //! whose buffers the CPU can write in place registers a `Direct` writer, and buffer writes it
 //! takes skip the staging.
 
+mod buffer;
+pub mod health;
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
+
+pub use buffer::GrowBuffer;
+pub use buffer::Readback;
+pub use buffer::padded_row_bytes;
+pub use buffer::unpad_rows;
 
 /// Writes `data` to `buffer` at `offset` in place, for the commands recorded after it, or
 /// returns false to have it staged. Commands recorded before it keep reading what they would
@@ -24,7 +32,7 @@ static DIRECT: OnceLock<Direct> = OnceLock::new();
 
 /// Registers the process's `Direct` writer. The first one stays.
 pub fn set_direct(direct: Direct) {
-    let _ = DIRECT.set(direct);
+    DIRECT.set(direct).ok();
 }
 
 /// The size of a new chunk; a larger write gets a chunk sized to its next power of two.
@@ -216,6 +224,14 @@ impl Staging {
     pub fn stats(&self) -> Stats {
         self.lock().stats
     }
+
+    /// Frees the chunks kept for reuse, those the GPU has handed back included; the next write
+    /// makes a new one. Chunks holding pending writes stay.
+    pub fn trim(&self) {
+        let mut s = self.lock();
+        while s.returned.try_recv().is_ok() {}
+        s.free.clear();
+    }
 }
 
 impl Inner {
@@ -248,7 +264,15 @@ impl Inner {
         let chunk = &mut self.active[index];
         let at = chunk.used.next_multiple_of(align);
         chunk.used = at + size;
-        let view = chunk.view.get_or_insert_with(|| chunk.buffer.get_mapped_range_mut(..).expect("a mapped staging chunk"));
+        let view = match chunk.view.take() {
+            Some(view) => chunk.view.insert(view),
+            None => match chunk.buffer.get_mapped_range_mut(..) {
+                Ok(view) => chunk.view.insert(view),
+                // A lost device's new chunk can't map. Its frame draws nothing and the renderer
+                // is made again on a new device, so the write has nowhere to go.
+                Err(_) => return (chunk.buffer.clone(), at),
+            },
+        };
         fill(&mut view.slice(at as usize..(at + size) as usize));
         self.pending_bytes += size;
         self.stats.writes += 1;
@@ -277,7 +301,7 @@ impl Inner {
             let buffer = chunk.buffer.clone();
             let mut back = Return { chunk: Some(chunk), recycle: self.recycle.clone(), lost: staging.1.clone() };
             encoder.map_buffer_on_submit(&buffer, wgpu::MapMode::Write, .., move |mapped| {
-                if mapped.is_ok() && let Some(chunk) = back.chunk.take() { let _ = back.recycle.send(chunk); }
+                if mapped.is_ok() && let Some(chunk) = back.chunk.take() { back.recycle.send(chunk).ok(); }
             });
         }
         staging.2.store(false, Ordering::Release);

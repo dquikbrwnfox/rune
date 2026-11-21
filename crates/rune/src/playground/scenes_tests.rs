@@ -1,12 +1,26 @@
 use super::*;
 
 #[test]
+fn unwinding_a_scene_restores_the_enclosing_clock() {
+    use crate::{SceneClock, scene_clock, with_scene_clock};
+
+    let outer = SceneClock { now: 4.0, dt: 0.1 };
+    with_scene_clock(outer, || {
+        let inner = SceneClock { now: 12.0, dt: 0.5 };
+        let result = std::panic::catch_unwind(|| with_scene_clock(inner, || panic!("scene failed")));
+        assert!(result.is_err());
+        assert_eq!(scene_clock(), outer);
+    });
+    assert_eq!(scene_clock(), SceneClock::default());
+}
+
+#[test]
 fn the_scene_filter_lists_only_the_scenes_it_keeps() {
     let mut rt = runtime_with(base().scenes(|name| name.contains('/')), Some(None), true);
     assert!(find(&rt, "playground-item-0").is_none() && find(&rt, "playground-item-1").is_none());
     assert!(find(&rt, "playground-item-2").is_some(), "Motion/Still stays");
     assert_eq!(selected(&rt), 2, "the list starts at its first listed story");
-    let live = rt.playground.as_ref().unwrap();
+    let live = rt.hooks.playground.as_ref().unwrap();
     assert_eq!(live.find("big"), None, "a hidden scene can't be chosen by name");
     assert_eq!(live.find("Still"), Some(2));
     letter(&mut rt, "k");

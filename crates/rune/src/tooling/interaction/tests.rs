@@ -90,6 +90,8 @@ fn view(s: &App, _: &mut Cx<App>) -> El {
 
 fn runtime(slow: bool) -> Runtime<App> {
     force_on();
+    // A fixed threshold: the slow-click tests never read `RUNE_PERF_SLOW_MS` from the environment.
+    super::force_slow_ms(SLOW_MS);
     SENT.take();
     let mut rt = Runtime::new(App { slow, ..App::default() }, view, (400.0, 300.0), Env::new(true, 1.0));
     rt.frame(0.0);
@@ -106,7 +108,7 @@ fn click(rt: &mut Runtime<App>, key: &str) {
     rt.pointer_down(x, y);
     rt.pointer_up(x, y);
     rt.frame(1.0 / 60.0);
-    rt.interaction_presented(Instant::now(), None);
+    rt.interaction_presented(crate::time::now(), None);
 }
 
 #[test]
@@ -165,7 +167,7 @@ fn typing_in_a_field_says_key_edit_never_the_text() {
     rt.interaction_tracker().rollup.take();
     rt.ime(Ime::Commit("secret".into()));
     rt.frame(1.0 / 60.0);
-    rt.interaction_presented(Instant::now(), None);
+    rt.interaction_presented(crate::time::now(), None);
     let rolls = rt.interaction_tracker().rollup.take();
     assert_eq!(rolls.iter().map(|r| (&*r.control.text, r.action)).collect::<Vec<_>>(), [("settings/note", "key_edit")]);
 }
@@ -192,7 +194,7 @@ fn off_nothing_is_timed() {
     click(&mut rt, "save-42");
     assert!(SENT.take().is_empty());
     let tracker = rt.interaction_tracker();
-    assert!(tracker.rollup.is_empty() && tracker.timed.is_none());
+    assert!(tracker.rollup.is_empty() && matches!(tracker.frame, Frame::Idle));
 }
 
 #[test]

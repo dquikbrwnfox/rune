@@ -1,7 +1,7 @@
 //! Where `El::anchored` overlays go, how long an `El::anchored_fit` one may be, and the zoom
 //! one inherits from its anchor.
 use super::*;
-use crate::el::{Anchor, Side};
+use crate::el::{Anchor, Flow, Pin, Side};
 
 /// The node an `El::above` anchor `a` names, among the `before` nodes ahead of its element.
 pub(super) fn anchor_index(nodes: &[Node], before: usize, a: &Anchor) -> Option<usize> {
@@ -52,6 +52,10 @@ pub(crate) fn anchor_position(a: &Anchor, t: [f32; 4], size: (f32, f32), vp: (f3
     // Along the main axis only keep the start edge inside; a long list may run off the far end
     // (`El::anchored_fit` bounds it instead).
     if vertical { y = y.max(margin) } else { x = x.max(margin) }
+    if a.round {
+        // `Math.round`: halves go up.
+        return ((x + 0.5).floor(), (y + 0.5).floor());
+    }
     (x, y)
 }
 
@@ -70,12 +74,11 @@ fn fit_bound(a: &Anchor, t: [f32; 4], len: f32, vp: (f32, f32)) -> Option<f32> {
     Some((own.max(other) - 0.5).floor().max(0.0))
 }
 
-impl<S: 'static> Measurement<'_, S> {
+impl Measurement<'_> {
     /// Places every node from `taffy`'s layout: ids, local and window rects, insets, and
     /// anchored overlays beside their anchors.
     pub(super) fn place(&mut self, taffy: &LayoutEngine, nodes: &mut [Node]) {
-        self.node_index.clear();
-        self.node_index.reserve(nodes.len());
+        self.node_index.rebuild(nodes.len());
         for i in 0..nodes.len() {
             let id = if nodes[i].id != NodeId(0) {
                 debug_assert_eq!(self.path_ids.get(&nodes[i].path).copied(), Some(nodes[i].id));
@@ -85,7 +88,14 @@ impl<S: 'static> Measurement<'_, S> {
             };
             nodes[i].id = id;
             self.node_index.insert(id, i);
-            let l = taffy.box_layout(nodes[i].taffy);
+            let mut l = taffy.box_layout(nodes[i].taffy);
+            // Right to left: laid out left to right, then mirrored inside the parent (`El::dir`).
+            if let Some(p) = nodes[i].parent.filter(|&p| nodes[p].flow == Flow::Rtl && nodes[i].pin == Pin::Flowing) {
+                l.x = nodes[p].local.w - l.x - l.w;
+            }
+            if nodes[i].flow == Flow::Rtl {
+                l.inset.swap(0, 2);
+            }
             nodes[i].local = MRect::new(l.x, l.y, l.w, l.h);
             let (px, py) = nodes[i].parent.map_or((0.0, 0.0), |p| (nodes[p].target[0], nodes[p].target[1]));
             let mut x = px + l.x;
@@ -221,18 +231,18 @@ fn attach_point(a: &Anchor, t: [f32; 4], d: [f32; 4]) -> [f32; 2] {
     }
 }
 
-impl<S: 'static> Runtime<S> {
+impl RuntimeCore {
     /// Sets up anchored overlay `i`'s inherited paint state beside anchor `j`: at the anchor's
     /// zoom (see [`inherited_zoom`]), placed and flipped by its zoomed size where the anchor was
     /// drawn, and zooming about the point it attaches at. Its own `prop::OFFSET` and transition
     /// still apply on top; its ancestors' positions and scales don't.
     pub(super) fn anchored_inh(&self, i: usize, j: usize, a: &Anchor, p: &rune_motion::Presented, pinh: &mut Inh) {
         let tracked = |m: &Node| if m.scale_track { self.scene.get(m.id, P_SCALE).unwrap_or(m.static_scale) } else { m.static_scale };
-        let k = inherited_zoom(&self.nodes, i, &tracked).max(MIN_ZOOM);
-        let d = self.drawn[j];
+        let k = inherited_zoom(&self.tree.nodes, i, &tracked).max(MIN_ZOOM);
+        let d = self.paint.drawn[j];
         let target = if d != [0.0; 4] { [d[0], d[1], d[0] + d[2], d[1] + d[3]] } else {
-            let t = sticky::anchored_target(&self.nodes, &self.scrolls, j, self.viewport);
-            if k == 1.0 { t } else { zoomed_rect(&self.nodes, &self.scrolls, j, t, self.viewport) }
+            let t = sticky::anchored_target(&self.tree.nodes, &self.scroll.scrolls, j, self.viewport);
+            if k == 1.0 { t } else { zoomed_rect(&self.tree.nodes, &self.scroll.scrolls, j, t, self.viewport) }
         };
         let zoomed;
         let a = if k == 1.0 { a } else { zoomed = zoomed_gap(a, k); &zoomed };
@@ -244,8 +254,8 @@ impl<S: 'static> Runtime<S> {
         // own `prop::OFFSET` and transition offset: with the frame position spring left in, an
         // End-aligned box growing in width would start from its old x and its end edge would
         // swing out and back. Zoomed about `pivot`, the box's top-left lands on (ax, ay).
-        let world = self.scene.world(self.nodes[i].id).unwrap_or(p.rect);
-        (pinh.snap.rigid, pinh.snap.layer) = ([0.0; 2], 0);
+        let world = self.scene.world(self.tree.nodes[i].id).unwrap_or(p.rect);
+        (pinh.snap.rigid, pinh.snap.steady, pinh.snap.layer) = ([0.0; 2], [0.0; 2], 0);
         if k == 1.0 {
             (pinh.dx, pinh.dy) = (ax - world.x, ay - world.y);
             (pinh.scale, pinh.anchor, pinh.anchor_to) = (1.0, [0.0; 2], [0.0; 2]);
@@ -256,7 +266,7 @@ impl<S: 'static> Runtime<S> {
         pinh.dy = pivot[1] + (ay - pivot[1]) / k - world.y;
         (pinh.scale, pinh.anchor, pinh.anchor_to) = (k, pivot, pivot);
         // Text rasterizes as the anchor's does: crisp at the zoom once it rests.
-        let motion = self.nodes[j].parent.and_then(|jp| self.inh_scratch.get(jp)).map_or(ScaleMotion::Still, |h| h.scale_motion);
+        let motion = self.tree.nodes[j].parent.and_then(|jp| self.paint.inh_scratch.get(jp)).map_or(ScaleMotion::Still, |h| h.scale_motion);
         pinh.scale_motion = pinh.scale_motion.max(motion);
         pinh.still = if pinh.scale_motion == ScaleMotion::Still { (k, pivot, pivot) } else { (1.0, [0.0; 2], [0.0; 2]) };
     }
